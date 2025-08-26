@@ -1,2 +1,26 @@
-.vscode
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Test binary, generated with go test -c
+*.test
+
+# Output of the go-fuzz command
+fuzz-target/
+
+# Go module cache and dependencies
+/vendor/
 go.sum
+
+# macOS-specific files
+.DS_Store
+
+# Common IDE/editor directories
+.idea/
+.vscode/
+.env
+.env.*
