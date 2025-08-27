@@ -24,10 +24,10 @@
 // Advanced usage with options:
 //
 //	allocator, err := slabby.New(4096, 10000,
-//		slabby.WithSecure(),         // Zero memory on deallocation
-//		slabby.WithBitGuard(),       // Memory corruption detection
-//		slabby.WithCircuitBreaker(5, time.Second), // Failure resilience
-//		slabby.WithHealthChecks(true), // Enable health monitoring
+//		slabby.WithSecure(),                        // Zero memory on deallocation
+//		slabby.WithBitGuard(),                      // Memory corruption detection
+//		slabby.WithCircuitBreaker(5, time.Second),  // Failure resilience
+//		slabby.WithHealthChecks(true),              // Enable health monitoring
 //	)
 package slabby
 
@@ -48,12 +48,14 @@ import (
 
 const (
 	Version = "2.3.0-enterprise"
+
 	// Cache line sizes for different architectures
 	CacheLineX86     = 64
 	CacheLineARM     = 64 // Most ARM64
 	CacheLineARMv7   = 32 // Older ARMv7
 	CacheLinePPC64   = 128
 	DefaultCacheLine = CacheLineX86
+
 	// Performance constants
 	DefaultShardCount    = 0 // Use GOMAXPROCS
 	MaxAllocationLatency = 100 * time.Microsecond
@@ -63,6 +65,7 @@ const (
 	SamplingRate         = 100  // Sample 1% of allocations for health metrics
 	MaxBatchSize         = 256  // Maximum batch allocation size
 	GuardPageSize        = 4096 // Guard page size for memory protection
+
 	// Circuit breaker states
 	circuitClosed   int32 = 0
 	circuitOpen     int32 = 1
@@ -177,27 +180,35 @@ type Slabby struct {
 	slabSize      int32
 	alignedSize   int32
 	totalCapacity int32
+
 	// Separate metadata from data for better cache efficiency
 	slabMetadata []slabMetadata
 	memoryPool   []byte
 	memoryBase   uintptr // Cache-aligned base address
 	guardPages   []byte  // Guard pages for memory protection
+
 	// High-performance allocation structures
 	perCPUCache   *perCPUCacheArray
 	lockFreeStack *lockFreeStack
 	shardedLists  *shardedFreeList
+
 	// Configuration and options
 	config allocatorConfig
+
 	// Statistics and monitoring - per-CPU to reduce contention
 	cpuStats      []cpuStatEntry
 	healthMetrics healthMetricsInternal
+
 	// Production features
 	circuitBreaker *circuitBreakerState
 	logger         *slog.Logger
+
 	// Fast random number generator for sharding
 	rngState uint64
+
 	// CPU identification cache
 	cpuIDCache atomic.Value // map[uintptr]uint64
+
 	// Synchronization
 	shutdownOnce sync.Once
 	shutdownChan chan struct{}
@@ -234,11 +245,13 @@ type perCPUCacheArray struct {
 	mask   uint64
 }
 
+// Thread-safe per-CPU cache entry with mutex protection
 type pcpuCacheEntry struct {
 	_     [DefaultCacheLine]byte // Padding
-	stack [PCCPUCacheSize]int32
-	count int32
-	hits  uint64 // Cache hit counter
+	stack [PCCPUCacheSize]int32  // Stack of slab IDs
+	count int32                  // Number of items in stack
+	hits  uint64                 // Cache hit counter (atomic)
+	mutex sync.Mutex             // Protect count and stack from races
 }
 
 // Sharded free list with improved distribution
@@ -541,6 +554,7 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 
 	// Record batch allocation
 	a.recordBatchAllocation(uint64(len(refs)))
+
 	if len(refs) == 0 {
 		a.recordError()
 		a.recordCircuitBreakerFailure()
@@ -577,7 +591,7 @@ func (a *Slabby) MustAllocate() *SlabRef {
 	return ref
 }
 
-// FIX: Corrected Deallocate method - check double deallocation BEFORE invalidating reference
+// Deallocate returns a slab reference to the pool for reuse.
 func (a *Slabby) Deallocate(ref *SlabRef) error {
 	if ref == nil {
 		a.recordError()
@@ -639,13 +653,10 @@ func (a *Slabby) Deallocate(ref *SlabRef) error {
 
 	// Update statistics
 	a.recordDeallocation()
-
 	// Record successful operation for circuit breaker
 	a.recordCircuitBreakerSuccess()
-
 	// Invalidate reference AFTER all operations
 	ref.invalidateReference()
-
 	return nil
 }
 
@@ -657,6 +668,7 @@ func (a *Slabby) BatchDeallocate(refs []*SlabRef) error {
 
 	errors := make([]error, 0, len(refs))
 	successCount := 0
+
 	for i, ref := range refs {
 		if err := a.Deallocate(ref); err != nil {
 			errors = append(errors, fmt.Errorf("ref[%d]: %w", i, err))
@@ -667,10 +679,12 @@ func (a *Slabby) BatchDeallocate(refs []*SlabRef) error {
 
 	// Record batch deallocation
 	a.recordBatchDeallocation(uint64(successCount))
+
 	if len(errors) > 0 {
 		return fmt.Errorf("slabby: %d of %d deallocations failed: %w",
 			len(errors), len(refs), errors[0]) // Return first error with count
 	}
+
 	return nil
 }
 
@@ -692,6 +706,7 @@ func (a *Slabby) Stats() *AllocatorStats {
 		totalErrors += atomic.LoadUint64(&cpu.errors)
 		totalHeapFallbacks += atomic.LoadUint64(&cpu.heapFallbacks)
 		totalGuardViolations += atomic.LoadUint64(&cpu.guardViolations)
+
 		cpuMax := atomic.LoadInt64(&cpu.maxAllocTime)
 		if cpuMax > maxAllocTime {
 			maxAllocTime = cpuMax
@@ -700,6 +715,7 @@ func (a *Slabby) Stats() *AllocatorStats {
 
 	usedSlabs := int(totalAllocs - totalDeallocs)
 	availableSlabs := int(a.totalCapacity) - usedSlabs
+
 	var avgAllocTime float64
 	if totalAllocs > 0 {
 		avgAllocTime = float64(totalAllocTime) / float64(totalAllocs)
@@ -793,7 +809,7 @@ func (a *Slabby) Secure() *SecureAllocator {
 	return &SecureAllocator{a}
 }
 
-// FIX: Improved Reset method to properly reinitialize all data structures
+// Reset clears all allocations and reinitializes data structures - use with caution in production.
 func (a *Slabby) Reset() {
 	// Mark all slabs as unused
 	for i := range a.slabMetadata {
@@ -806,7 +822,10 @@ func (a *Slabby) Reset() {
 	// Reset all caches and lists
 	if a.config.enablePCPUCache {
 		for i := range a.perCPUCache.caches {
-			a.perCPUCache.caches[i].count = 0
+			cache := &a.perCPUCache.caches[i]
+			cache.mutex.Lock()
+			cache.count = 0
+			cache.mutex.Unlock()
 		}
 	}
 
@@ -910,6 +929,7 @@ func (r *SlabRef) GetBytes() []byte {
 	if allocator.config.enableGuardPages {
 		offset += int64(r.slabID) * int64(GuardPageSize) // Skip guard pages
 	}
+
 	return allocator.memoryPool[offset : offset+int64(allocator.slabSize)]
 }
 
@@ -970,14 +990,18 @@ func (s *lockFreeStack) pop() (int32, bool) {
 	}
 }
 
-// Per-CPU cache operations
+// Thread-safe per-CPU cache operations with mutex protection
 func (c *perCPUCacheArray) get() (int32, bool) {
 	cpuID := getCurrentCPUID()
 	cache := &c.caches[cpuID&c.mask]
+
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
 	if cache.count > 0 {
 		cache.count--
 		slabID := cache.stack[cache.count]
-		atomic.AddUint64(&cache.hits, 1)
+		atomic.AddUint64(&cache.hits, 1) // Keep hits atomic for lock-free reads
 		return slabID, true
 	}
 	return -1, false
@@ -986,6 +1010,10 @@ func (c *perCPUCacheArray) get() (int32, bool) {
 func (c *perCPUCacheArray) put(slabID int32) bool {
 	cpuID := getCurrentCPUID()
 	cache := &c.caches[cpuID&c.mask]
+
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
 	if cache.count < PCCPUCacheSize {
 		cache.stack[cache.count] = slabID
 		cache.count++
@@ -998,6 +1026,7 @@ func (c *perCPUCacheArray) put(slabID int32) bool {
 func newImprovedShardedFreeList(capacity, shardCount int) *shardedFreeList {
 	actualShardCount := nextPowerOfTwo(uint32(shardCount))
 	mask := actualShardCount - 1
+
 	fl := &shardedFreeList{
 		shardArray: make([]freeListShard, actualShardCount),
 		shardMask:  mask,
@@ -1024,6 +1053,7 @@ func (fl *shardedFreeList) get() (int32, bool) {
 	for attempt := 0; attempt < len(fl.shardArray); attempt++ {
 		shardIdx := (startIdx + uint32(attempt)) & fl.shardMask
 		shard := &fl.shardArray[shardIdx]
+
 		shard.slabLock.Lock()
 		if len(shard.slabIDs) > 0 {
 			// Pop from end for better cache locality
@@ -1033,11 +1063,13 @@ func (fl *shardedFreeList) get() (int32, bool) {
 			return slabID, true
 		}
 		shard.slabLock.Unlock()
+
 		// Brief backoff on contention
 		if attempt > 0 {
 			runtime.Gosched()
 		}
 	}
+
 	return -1, false
 }
 
@@ -1049,15 +1081,6 @@ func (fl *shardedFreeList) put(slabID int32) {
 	shard.slabLock.Unlock()
 }
 
-func (fl *shardedFreeList) reset() {
-	for i := range fl.shardArray {
-		shard := &fl.shardArray[i]
-		shard.slabLock.Lock()
-		shard.slabIDs = shard.slabIDs[:0]
-		shard.slabLock.Unlock()
-	}
-}
-
 func (a *Slabby) createSlabRef(slabID int32, startTime int64, isHeapAlloc bool) (*SlabRef, error) {
 	if !isHeapAlloc {
 		slabEntry := &a.slabMetadata[slabID]
@@ -1066,7 +1089,7 @@ func (a *Slabby) createSlabRef(slabID int32, startTime int64, isHeapAlloc bool) 
 			a.recordError()
 			return nil, fmt.Errorf("slabby: race condition in allocation")
 		}
-		// Prefetch the slab data for better cache performance
+		// Safe prefetch of slab data only (no metadata access)
 		a.prefetchSlab(slabID)
 	}
 
@@ -1205,6 +1228,7 @@ func (a *Slabby) zeroSlabMemory(slabID int32) {
 	}
 
 	dataSlice := a.memoryPool[offset : offset+int64(a.slabSize)]
+
 	// Use more efficient clearing for larger slabs
 	if a.slabSize > 1024 {
 		// Clear in larger chunks for better performance
@@ -1226,23 +1250,61 @@ func (a *Slabby) zeroSlabMemory(slabID int32) {
 	}
 }
 
+// Safe prefetch implementation that only touches slab data, not metadata
 func (a *Slabby) prefetchSlab(slabID int32) {
 	if slabID < 0 || slabID >= a.totalCapacity {
 		return
 	}
 
-	// Prefetch the slab metadata and data
-	metadata := &a.slabMetadata[slabID]
+	// Calculate slab data bounds safely
 	offset := int64(slabID) * int64(a.alignedSize)
-	// Add guard page offset if enabled
 	if a.config.enableGuardPages {
 		offset += int64(slabID) * int64(GuardPageSize)
 	}
 
-	dataPtr := unsafe.Pointer(&a.memoryPool[offset])
-	// Use architecture-specific prefetch instructions
-	prefetch(unsafe.Pointer(metadata))
-	prefetch(dataPtr)
+	// Ensure we don't go out of bounds of the memory pool
+	if offset >= int64(len(a.memoryPool)) || offset < 0 {
+		return
+	}
+
+	// Calculate safe prefetch size
+	availableSize := int64(len(a.memoryPool)) - offset
+	prefetchSize := int64(a.slabSize)
+	if prefetchSize > availableSize {
+		prefetchSize = availableSize
+	}
+
+	if prefetchSize <= 0 {
+		return
+	}
+
+	// Use safe slice-based prefetching instead of pointer arithmetic
+	prefetchSliceSafe(a.memoryPool, int(offset), int(prefetchSize))
+}
+
+// Slice-based prefetch that avoids all pointer arithmetic
+func prefetchSliceSafe(data []byte, offset, size int) {
+	if offset < 0 || size <= 0 || offset >= len(data) {
+		return
+	}
+
+	// Ensure we don't go past the end of the slice
+	end := offset + size
+	if end > len(data) {
+		end = len(data)
+	}
+
+	// Prefetch by touching memory at cache-line intervals using safe slice indexing
+	for i := offset; i < end; i += DefaultCacheLine {
+		if i < len(data) {
+			_ = data[i] // Safe slice access - no pointer arithmetic
+		}
+	}
+
+	// Also touch the last byte if we haven't already
+	if end-1 >= offset && end-1 < len(data) && (end-offset) > DefaultCacheLine {
+		_ = data[end-1]
+	}
 }
 
 // Enhanced guard page checking with optimized performance
@@ -1284,9 +1346,11 @@ func (a *Slabby) checkGuardPages(slabID int32) error {
 	if err := checkGuardRegion(beforeGuard, "before"); err != nil {
 		return err
 	}
+
 	if err := checkGuardRegion(afterGuard, "after"); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -1464,7 +1528,7 @@ func (a *Slabby) startHealthMonitoring() {
 	}()
 }
 
-// FIX: Enhanced health metrics update with proper initialization
+// Enhanced health metrics update with proper initialization
 func (a *Slabby) updateHealthMetrics() {
 	a.healthMetrics.healthMutex.Lock()
 	defer a.healthMetrics.healthMutex.Unlock()
@@ -1522,6 +1586,7 @@ func (a *Slabby) analyzeTrend() string {
 	// Simple trend analysis based on recent health scores
 	validScores := 0
 	sumDelta := 0.0
+
 	for i := 1; i < len(a.healthMetrics.trendHistory); i++ {
 		curr := a.healthMetrics.trendHistory[i]
 		prev := a.healthMetrics.trendHistory[i-1]
@@ -1541,6 +1606,7 @@ func (a *Slabby) analyzeTrend() string {
 	} else if avgDelta < -0.05 {
 		return "degrading"
 	}
+
 	return "stable"
 }
 
@@ -1724,20 +1790,4 @@ func nextPowerOfTwo(v uint32) uint32 {
 		return 1
 	}
 	return 1 << bits.Len32(v-1)
-}
-
-// Enhanced prefetch implementation with better memory touching
-func prefetch(ptr unsafe.Pointer) {
-	// Use compiler-specific prefetch intrinsics if available
-	// This is a generic implementation that works across architectures
-	// Cast to uintptr for arithmetic
-	addr := uintptr(ptr)
-	// Prefetch multiple cache lines ahead
-	for i := 0; i < 4; i++ {
-		// Touch the memory to encourage caching
-		_ = *(*byte)(unsafe.Pointer(addr + uintptr(i*DefaultCacheLine)))
-	}
-	// On x86, we could use:
-	// __builtin_prefetch(ptr, 0, 3) // PREFETCHT0
-	// But this requires platform-specific code or compiler intrinsics
 }
