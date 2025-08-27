@@ -232,12 +232,10 @@ func TestErrorConditions(t *testing.T) {
 			t.Fatalf("First deallocation failed: %v", err)
 		}
 
-		// Second deallocation should fail with ErrInvalidReference
-		// The reference is now invalidated, but the allocState should still be 1
-		if err := allocator.Deallocate(ref); err != ErrInvalidReference {
-			// Since the reference gets invalidated, we expect ErrInvalidReference
-			// This is actually the correct behavior
-			t.Errorf("Expected ErrInvalidReference after reference invalidation, got %v", err)
+		// Second deallocation should fail with ErrDoubleDeallocation
+		// The allocState is now 1 (deallocated), so CompareAndSwap(0,1) fails
+		if err := allocator.Deallocate(ref); err != ErrDoubleDeallocation {
+			t.Errorf("Expected ErrDoubleDeallocation for second deallocation, got %v", err)
 		}
 
 		// Test double deallocation with a fresh reference that has the same state
@@ -367,6 +365,7 @@ func TestSecureMode(t *testing.T) {
 			}
 		}
 	}
+
 	ref2.Release()
 }
 
@@ -385,6 +384,7 @@ func TestBitGuard(t *testing.T) {
 
 	// Corrupt the guard word
 	ref.guardWord = 0xBADC0DE
+
 	// Deallocation should detect corruption
 	if err := ref.Release(); err != ErrMemoryCorruption {
 		t.Errorf("Expected ErrMemoryCorruption, got %v", err)
@@ -566,6 +566,7 @@ func TestConcurrentAccess(t *testing.T) {
 					}
 
 					localRefs = append(localRefs, ref)
+
 					// Write to the memory to test for races
 					data := ref.GetBytes()
 					for k := range data {
@@ -576,6 +577,7 @@ func TestConcurrentAccess(t *testing.T) {
 					idx := rand.Intn(len(localRefs))
 					ref := localRefs[idx]
 					localRefs = append(localRefs[:idx], localRefs[idx+1:]...)
+
 					if err := ref.Release(); err != nil {
 						errors <- fmt.Errorf("goroutine %d: deallocation failed: %v", goroutineID, err)
 						continue
@@ -793,6 +795,7 @@ func BenchmarkAllocateDeallocate(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		refs := make([]*SlabRef, 0, 100)
+
 		for pb.Next() {
 			// Allocate
 			ref, err := allocator.Allocate()
@@ -901,6 +904,7 @@ func TestStressTest(t *testing.T) {
 					idx := rand.Intn(len(refs))
 					ref := refs[idx]
 					refs = append(refs[:idx], refs[idx+1:]...)
+
 					if err := ref.Release(); err != nil {
 						atomic.AddInt64(&errors, 1)
 					}
@@ -945,6 +949,7 @@ func TestMemoryAlignment(t *testing.T) {
 
 	data := ref.GetBytes()
 	addr := uintptr(unsafe.Pointer(&data[0]))
+
 	// Check that the address is cache-line aligned
 	if addr%64 != 0 {
 		t.Errorf("Memory not cache-line aligned: address %x", addr)
@@ -969,6 +974,7 @@ func TestFinalizers(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
 	time.Sleep(10 * time.Millisecond)
+
 	// The finalizer should have detected the leak and logged it
 	// (We can't easily test the log output, but we can verify the finalizer was set)
 }
@@ -1003,11 +1009,13 @@ func ExampleSlabby() {
 	// Use the allocated memory
 	data := ref.GetBytes()
 	copy(data, []byte("Hello, World!"))
+
 	fmt.Printf("Allocated %d bytes, wrote %d bytes\n", len(data), len("Hello, World!"))
 
 	// Get statistics
 	stats := allocator.Stats()
 	fmt.Printf("Total allocations: %d\n", stats.TotalAllocations)
+
 	// Output: Allocated 4096 bytes, wrote 13 bytes
 	// Total allocations: 1
 }

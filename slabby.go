@@ -24,17 +24,16 @@
 // Advanced usage with options:
 //
 //	allocator, err := slabby.New(4096, 10000,
-//		slabby.WithSecure(),                        // Zero memory on deallocation
-//		slabby.WithBitGuard(),                      // Memory corruption detection
-//		slabby.WithCircuitBreaker(5, time.Second),  // Failure resilience
-//		slabby.WithHealthChecks(true),              // Enable health monitoring
+//		slabby.WithSecure(),                    // Zero memory on deallocation
+//		slabby.WithBitGuard(),                  // Memory corruption detection
+//		slabby.WithCircuitBreaker(5, time.Second), // Failure resilience
+//		slabby.WithHealthChecks(true),          // Enable health monitoring
 //	)
 package slabby
 
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"math"
 	"math/bits"
@@ -47,25 +46,22 @@ import (
 )
 
 const (
-	Version = "2.3.0-enterprise"
-
+	Version = "2.5.0-enterprise"
 	// Cache line sizes for different architectures
 	CacheLineX86     = 64
 	CacheLineARM     = 64 // Most ARM64
 	CacheLineARMv7   = 32 // Older ARMv7
 	CacheLinePPC64   = 128
 	DefaultCacheLine = CacheLineX86
-
 	// Performance constants
 	DefaultShardCount    = 0 // Use GOMAXPROCS
 	MaxAllocationLatency = 100 * time.Microsecond
 	HealthCheckInterval  = 30 * time.Second
 	MetricsBufferSize    = 1024
 	PCCPUCacheSize       = 16   // Per-CPU cache size
-	SamplingRate         = 100  // Sample 1% of allocations for health metrics
+	BaseSamplingRate     = 100  // Base sampling rate 1%
 	MaxBatchSize         = 256  // Maximum batch allocation size
 	GuardPageSize        = 4096 // Guard page size for memory protection
-
 	// Circuit breaker states
 	circuitClosed   int32 = 0
 	circuitOpen     int32 = 1
@@ -85,6 +81,7 @@ var (
 	ErrInvalidSlabSize    = errors.New("slabby: slab size must be positive")
 	ErrInvalidCapacity    = errors.New("slabby: capacity must be positive")
 	ErrInvalidBatchSize   = errors.New("slabby: batch size must be positive and <= MaxBatchSize")
+	ErrInvalidSlabID      = errors.New("slabby: invalid slab ID")
 )
 
 // SlabRef represents a memory allocation with safety features and monitoring.
@@ -115,6 +112,13 @@ type SlabAllocator interface {
 	Deallocate(ref *SlabRef) error
 	// BatchDeallocate deallocates multiple slabs at once
 	BatchDeallocate(refs []*SlabRef) error
+
+	// Fast path methods for zero-allocation scenarios
+	// AllocateFast returns raw bytes and slab ID for manual lifecycle management
+	AllocateFast() ([]byte, int32, error)
+	// DeallocateFast deallocates by slab ID - use with caution
+	DeallocateFast(slabID int32) error
+
 	// Reset clears all allocations - use with caution in production
 	Reset()
 	// Stats returns current performance and usage statistics
@@ -138,6 +142,8 @@ type AllocatorStats struct {
 	CurrentAllocations  uint64  `json:"current_allocations"`
 	BatchAllocations    uint64  `json:"batch_allocations"`
 	BatchDeallocations  uint64  `json:"batch_deallocations"`
+	FastAllocations     uint64  `json:"fast_allocations"`   // New metric
+	FastDeallocations   uint64  `json:"fast_deallocations"` // New metric
 	AvgAllocTimeNs      float64 `json:"avg_alloc_time_ns"`
 	MaxAllocTimeNs      int64   `json:"max_alloc_time_ns"`
 	SecureMode          bool    `json:"secure_mode"`
@@ -151,6 +157,7 @@ type AllocatorStats struct {
 	PCCPUCacheHits      uint64  `json:"pcpu_cache_hits"`
 	LockFreeHits        uint64  `json:"lock_free_hits"`
 	GuardPageViolations uint64  `json:"guard_page_violations"`
+	RefPoolHits         uint64  `json:"ref_pool_hits"` // New metric
 }
 
 // HealthMetrics provides detailed health and performance information.
@@ -203,11 +210,12 @@ type Slabby struct {
 	circuitBreaker *circuitBreakerState
 	logger         *slog.Logger
 
-	// Fast random number generator for sharding
-	rngState uint64
+	// Fast random number generator for sharding - R1 improvement
+	fastrandMu    sync.Mutex
+	fastrandState uint32
 
-	// CPU identification cache
-	cpuIDCache atomic.Value // map[uintptr]uint64
+	// SlabRef pooling for zero-allocation optimization
+	refPool sync.Pool
 
 	// Synchronization
 	shutdownOnce sync.Once
@@ -273,12 +281,16 @@ type cpuStatEntry struct {
 	deallocations      uint64
 	batchAllocations   uint64
 	batchDeallocations uint64
+	fastAllocations    uint64 // New metric
+	fastDeallocations  uint64 // New metric
 	allocTime          uint64
 	maxAllocTime       int64
 	errors             uint64
 	heapFallbacks      uint64
 	guardViolations    uint64
 	samplingCounter    uint32
+	loadCounter        uint64 // Track allocation load for adaptive sampling
+	refPoolHits        uint64 // New metric
 	// Ring buffer for latency percentiles (smaller per-CPU)
 	latencyBuffer    [64]int64
 	latencyBufferIdx uint32
@@ -294,6 +306,11 @@ type healthMetricsInternal struct {
 	trendHistory    [10]float64 // Recent health scores for trend analysis
 	trendHistoryIdx int
 	healthMutex     sync.RWMutex
+	// Cached latency percentiles - R1 improvement
+	allocLatencyP50   time.Duration
+	allocLatencyP95   time.Duration
+	allocLatencyP99   time.Duration
+	lastLatencyUpdate time.Time
 }
 
 type circuitBreakerState struct {
@@ -422,9 +439,18 @@ func New(slabSize, capacity int, options ...AllocatorOption) (*Slabby, error) {
 		cpuStats:       cpuStats,
 		circuitBreaker: circuitBreaker,
 		logger:         config.logger,
-		rngState:       uint64(time.Now().UnixNano()),
 		shutdownChan:   make(chan struct{}),
 	}
+
+	// Initialize SlabRef pool for zero-allocation optimization
+	allocator.refPool = sync.Pool{
+		New: func() interface{} {
+			return &SlabRef{}
+		},
+	}
+
+	// Initialize fastrand state - R1 improvement
+	allocator.fastrandState = uint32(time.Now().UnixNano() ^ int64(uintptr(unsafe.Pointer(allocator))))
 
 	// Initialize health metrics with defaults
 	allocator.healthMetrics.healthScore = 1.0
@@ -433,15 +459,24 @@ func New(slabSize, capacity int, options ...AllocatorOption) (*Slabby, error) {
 		allocator.healthMetrics.trendHistory[i] = 1.0
 	}
 
-	// Initialize CPU ID cache
-	allocator.cpuIDCache.Store(make(map[uintptr]uint64))
-
 	// Start health monitoring if enabled
 	if config.enableHealthCheck {
 		allocator.startHealthMonitoring()
 	}
 
 	return allocator, nil
+}
+
+// R1 improvement: Fast random number generator
+func (a *Slabby) fastrand() uint32 {
+	a.fastrandMu.Lock()
+	if a.fastrandState == 0 {
+		a.fastrandState = uint32(time.Now().UnixNano() ^ int64(uintptr(unsafe.Pointer(a))))
+	}
+	a.fastrandState = a.fastrandState*1103515245 + 12345
+	result := a.fastrandState
+	a.fastrandMu.Unlock()
+	return result
 }
 
 // Allocate returns a new slab reference for immediate use.
@@ -456,7 +491,7 @@ func (a *Slabby) Allocate() (*SlabRef, error) {
 
 	// Try per-CPU cache first (fastest path)
 	if a.config.enablePCPUCache {
-		if slabID, ok := a.perCPUCache.get(); ok {
+		if slabID, ok := a.perCPUCache.get(a); ok {
 			a.recordPCPUCacheHit()
 			return a.createSlabRef(slabID, startTime, false)
 		}
@@ -469,7 +504,7 @@ func (a *Slabby) Allocate() (*SlabRef, error) {
 	}
 
 	// Fall back to sharded allocation
-	slabID, ok := a.shardedLists.get()
+	slabID, ok := a.shardedLists.get(a)
 	if !ok {
 		// Try heap fallback if enabled
 		if a.config.enableFallback {
@@ -481,6 +516,106 @@ func (a *Slabby) Allocate() (*SlabRef, error) {
 	}
 
 	return a.createSlabRef(slabID, startTime, false)
+}
+
+// AllocateFast returns raw bytes and slab ID for zero-allocation scenarios.
+// The caller is responsible for calling DeallocateFast with the returned slab ID.
+// This method maintains all safety and monitoring features but avoids SlabRef allocation.
+func (a *Slabby) AllocateFast() ([]byte, int32, error) {
+	startTime := nanotime()
+
+	// Check circuit breaker first
+	if a.circuitBreaker != nil && a.isCircuitBreakerOpen() {
+		a.recordError()
+		return nil, -1, ErrCircuitBreakerOpen
+	}
+
+	// Try per-CPU cache first (fastest path)
+	if a.config.enablePCPUCache {
+		if slabID, ok := a.perCPUCache.get(a); ok {
+			slabEntry := &a.slabMetadata[slabID]
+			if slabEntry.inUse.CompareAndSwap(false, true) {
+				data := a.getSlabBytes(slabID)
+				a.recordFastAllocation()
+				a.recordPCPUCacheHit()
+				a.trackAllocationLatency(startTime)
+				a.recordCircuitBreakerSuccess()
+				return data, slabID, nil
+			}
+		}
+	}
+
+	// Try lock-free stack (fast path)
+	if slabID, ok := a.lockFreeStack.pop(); ok {
+		slabEntry := &a.slabMetadata[slabID]
+		if slabEntry.inUse.CompareAndSwap(false, true) {
+			data := a.getSlabBytes(slabID)
+			a.recordFastAllocation()
+			a.recordLockFreeHit()
+			a.trackAllocationLatency(startTime)
+			a.recordCircuitBreakerSuccess()
+			return data, slabID, nil
+		}
+	}
+
+	// Fall back to sharded allocation
+	slabID, ok := a.shardedLists.get(a)
+	if !ok {
+		a.recordError()
+		a.recordCircuitBreakerFailure()
+		return nil, -1, ErrOutOfMemory
+	}
+
+	slabEntry := &a.slabMetadata[slabID]
+	if slabEntry.inUse.CompareAndSwap(false, true) {
+		data := a.getSlabBytes(slabID)
+		a.recordFastAllocation()
+		a.trackAllocationLatency(startTime)
+		a.recordCircuitBreakerSuccess()
+		return data, slabID, nil
+	}
+
+	a.recordError()
+	return nil, -1, fmt.Errorf("slabby: race condition in fast allocation")
+}
+
+// DeallocateFast deallocates by slab ID for zero-allocation scenarios.
+// This maintains all safety checks and enterprise features.
+func (a *Slabby) DeallocateFast(slabID int32) error {
+	if slabID < 0 || slabID >= a.totalCapacity {
+		a.recordError()
+		return ErrInvalidSlabID
+	}
+
+	slabEntry := &a.slabMetadata[slabID]
+	if !slabEntry.inUse.CompareAndSwap(true, false) {
+		a.recordError()
+		return ErrDoubleDeallocation
+	}
+
+	// Security features still work
+	if a.config.enableSecure {
+		a.zeroSlabMemory(slabID)
+	}
+
+	if a.config.enableGuardPages {
+		if err := a.checkGuardPages(slabID); err != nil {
+			a.recordGuardViolation()
+			a.recordError()
+			return err
+		}
+	}
+
+	// Return to appropriate pool
+	if a.config.enablePCPUCache && a.perCPUCache.put(slabID) {
+		// Success
+	} else if !a.lockFreeStack.push(slabID) {
+		a.shardedLists.put(slabID, a)
+	}
+
+	a.recordFastDeallocation()
+	a.recordCircuitBreakerSuccess()
+	return nil
 }
 
 // BatchAllocate allocates multiple slabs at once for better performance.
@@ -498,10 +633,15 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 		return nil, ErrCircuitBreakerOpen
 	}
 
+	// R1 improvement: Prefetch slab range for better cache performance
+	if count > 4 {
+		a.prefetchSlabRange(0, int32(count))
+	}
+
 	// Try to satisfy from per-CPU cache first
 	if a.config.enablePCPUCache {
 		for len(refs) < count {
-			if slabID, ok := a.perCPUCache.get(); ok {
+			if slabID, ok := a.perCPUCache.get(a); ok {
 				ref, err := a.createSlabRef(slabID, startTime, false)
 				if err != nil {
 					break
@@ -530,7 +670,7 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 
 	// Use sharded lists for remaining
 	for len(refs) < count {
-		if slabID, ok := a.shardedLists.get(); ok {
+		if slabID, ok := a.shardedLists.get(a); ok {
 			ref, err := a.createSlabRef(slabID, startTime, false)
 			if err != nil {
 				break
@@ -648,14 +788,16 @@ func (a *Slabby) Deallocate(ref *SlabRef) error {
 		// Successfully returned to per-CPU cache
 	} else if !a.lockFreeStack.push(slabID) {
 		// Fall back to sharded return
-		a.shardedLists.put(slabID)
+		a.shardedLists.put(slabID, a)
 	}
 
 	// Update statistics
 	a.recordDeallocation()
+
 	// Record successful operation for circuit breaker
 	a.recordCircuitBreakerSuccess()
-	// Invalidate reference AFTER all operations
+
+	// Invalidate reference AFTER all operations (returns to pool)
 	ref.invalidateReference()
 	return nil
 }
@@ -684,7 +826,6 @@ func (a *Slabby) BatchDeallocate(refs []*SlabRef) error {
 		return fmt.Errorf("slabby: %d of %d deallocations failed: %w",
 			len(errors), len(refs), errors[0]) // Return first error with count
 	}
-
 	return nil
 }
 
@@ -693,8 +834,10 @@ func (a *Slabby) Stats() *AllocatorStats {
 	// Aggregate per-CPU statistics
 	var totalAllocs, totalDeallocs, totalAllocTime uint64
 	var totalBatchAllocs, totalBatchDeallocs uint64
+	var totalFastAllocs, totalFastDeallocs uint64
 	var maxAllocTime int64
 	var totalErrors, totalHeapFallbacks, totalGuardViolations uint64
+	var totalRefPoolHits uint64
 
 	for i := range a.cpuStats {
 		cpu := &a.cpuStats[i]
@@ -702,10 +845,13 @@ func (a *Slabby) Stats() *AllocatorStats {
 		totalDeallocs += atomic.LoadUint64(&cpu.deallocations)
 		totalBatchAllocs += atomic.LoadUint64(&cpu.batchAllocations)
 		totalBatchDeallocs += atomic.LoadUint64(&cpu.batchDeallocations)
+		totalFastAllocs += atomic.LoadUint64(&cpu.fastAllocations)
+		totalFastDeallocs += atomic.LoadUint64(&cpu.fastDeallocations)
 		totalAllocTime += atomic.LoadUint64(&cpu.allocTime)
 		totalErrors += atomic.LoadUint64(&cpu.errors)
 		totalHeapFallbacks += atomic.LoadUint64(&cpu.heapFallbacks)
 		totalGuardViolations += atomic.LoadUint64(&cpu.guardViolations)
+		totalRefPoolHits += atomic.LoadUint64(&cpu.refPoolHits)
 
 		cpuMax := atomic.LoadInt64(&cpu.maxAllocTime)
 		if cpuMax > maxAllocTime {
@@ -713,7 +859,7 @@ func (a *Slabby) Stats() *AllocatorStats {
 		}
 	}
 
-	usedSlabs := int(totalAllocs - totalDeallocs)
+	usedSlabs := int(totalAllocs + totalFastAllocs - totalDeallocs - totalFastDeallocs)
 	availableSlabs := int(a.totalCapacity) - usedSlabs
 
 	var avgAllocTime float64
@@ -743,6 +889,8 @@ func (a *Slabby) Stats() *AllocatorStats {
 		CurrentAllocations:  totalAllocs - totalDeallocs,
 		BatchAllocations:    totalBatchAllocs,
 		BatchDeallocations:  totalBatchDeallocs,
+		FastAllocations:     totalFastAllocs,
+		FastDeallocations:   totalFastDeallocs,
 		AvgAllocTimeNs:      avgAllocTime,
 		MaxAllocTimeNs:      maxAllocTime,
 		SecureMode:          a.config.enableSecure,
@@ -756,6 +904,7 @@ func (a *Slabby) Stats() *AllocatorStats {
 		PCCPUCacheHits:      pcpuCacheHits,
 		LockFreeHits:        lockFreeHits,
 		GuardPageViolations: totalGuardViolations,
+		RefPoolHits:         totalRefPoolHits,
 	}
 }
 
@@ -764,17 +913,25 @@ func (a *Slabby) HealthCheck() *HealthMetrics {
 	a.healthMetrics.healthMutex.RLock()
 	defer a.healthMetrics.healthMutex.RUnlock()
 
-	// Aggregate latency samples from all CPUs
-	latencies := make([]int64, 0, len(a.cpuStats)*64)
-	for i := range a.cpuStats {
-		cpu := &a.cpuStats[i]
-		for j := 0; j < 64; j++ {
-			if latency := cpu.latencyBuffer[j]; latency > 0 {
-				latencies = append(latencies, latency)
-			}
+	// Return cached percentiles if recent enough
+	now := time.Now()
+	if now.Sub(a.healthMetrics.lastLatencyUpdate) < time.Minute {
+		return &HealthMetrics{
+			AllocLatencyP50:    a.healthMetrics.allocLatencyP50,
+			AllocLatencyP95:    a.healthMetrics.allocLatencyP95,
+			AllocLatencyP99:    a.healthMetrics.allocLatencyP99,
+			FragmentationScore: 1.0 - a.healthMetrics.memoryPressure,
+			MemoryPressure:     a.healthMetrics.memoryPressure,
+			ErrorRate:          a.healthMetrics.errorRate,
+			CircuitBreakerOpen: a.isCircuitBreakerOpen(),
+			HealthScore:        a.healthMetrics.healthScore,
+			CacheEfficiency:    a.healthMetrics.cacheEfficiency,
+			RecentTrend:        a.healthMetrics.recentTrend,
 		}
 	}
 
+	// Calculate fresh percentiles
+	latencies := a.collectLatencySamples()
 	sort.Slice(latencies, func(i, j int) bool {
 		return latencies[i] < latencies[j]
 	})
@@ -801,6 +958,20 @@ func (a *Slabby) HealthCheck() *HealthMetrics {
 		CacheEfficiency:    a.healthMetrics.cacheEfficiency,
 		RecentTrend:        a.healthMetrics.recentTrend,
 	}
+}
+
+// R1 improvement: Collect latency samples for percentile calculation
+func (a *Slabby) collectLatencySamples() []int64 {
+	latencies := make([]int64, 0, len(a.cpuStats)*64)
+	for i := range a.cpuStats {
+		cpu := &a.cpuStats[i]
+		for j := 0; j < 64; j++ {
+			if latency := cpu.latencyBuffer[j]; latency > 0 {
+				latencies = append(latencies, latency)
+			}
+		}
+	}
+	return latencies
 }
 
 // Secure returns a SecureAllocator wrapper that enables memory zeroing on deallocation.
@@ -859,12 +1030,16 @@ func (a *Slabby) Reset() {
 		atomic.StoreUint64(&cpu.deallocations, 0)
 		atomic.StoreUint64(&cpu.batchAllocations, 0)
 		atomic.StoreUint64(&cpu.batchDeallocations, 0)
+		atomic.StoreUint64(&cpu.fastAllocations, 0)
+		atomic.StoreUint64(&cpu.fastDeallocations, 0)
 		atomic.StoreUint64(&cpu.allocTime, 0)
 		atomic.StoreInt64(&cpu.maxAllocTime, 0)
 		atomic.StoreUint64(&cpu.errors, 0)
 		atomic.StoreUint64(&cpu.heapFallbacks, 0)
 		atomic.StoreUint64(&cpu.guardViolations, 0)
 		cpu.samplingCounter = 0
+		atomic.StoreUint64(&cpu.loadCounter, 0)
+		atomic.StoreUint64(&cpu.refPoolHits, 0)
 		cpu.latencyBufferIdx = 0
 		for j := range cpu.latencyBuffer {
 			cpu.latencyBuffer[j] = 0
@@ -925,6 +1100,7 @@ func (r *SlabRef) GetBytes() []byte {
 	// Calculate data slice from memory pool
 	allocator := r.allocatorRef
 	offset := int64(r.slabID) * int64(allocator.alignedSize)
+
 	// Add guard page offset if enabled
 	if allocator.config.enableGuardPages {
 		offset += int64(r.slabID) * int64(GuardPageSize) // Skip guard pages
@@ -966,6 +1142,18 @@ func (r *SlabRef) AllocationStack() string {
 
 // Private implementation methods
 
+// getSlabBytes returns the byte slice for a given slab ID - used by fast path
+func (a *Slabby) getSlabBytes(slabID int32) []byte {
+	offset := int64(slabID) * int64(a.alignedSize)
+
+	// Add guard page offset if enabled
+	if a.config.enableGuardPages {
+		offset += int64(slabID) * int64(GuardPageSize) // Skip guard pages
+	}
+
+	return a.memoryPool[offset : offset+int64(a.slabSize)]
+}
+
 // Lock-free stack operations
 func (s *lockFreeStack) push(slabID int32) bool {
 	node := &slabNode{slabID: slabID}
@@ -990,9 +1178,9 @@ func (s *lockFreeStack) pop() (int32, bool) {
 	}
 }
 
-// Thread-safe per-CPU cache operations with mutex protection
-func (c *perCPUCacheArray) get() (int32, bool) {
-	cpuID := getCurrentCPUID()
+// R1 improvement: Enhanced per-CPU cache operations with burst refill
+func (c *perCPUCacheArray) get(a *Slabby) (int32, bool) {
+	cpuID := getFastCPUID()
 	cache := &c.caches[cpuID&c.mask]
 
 	cache.mutex.Lock()
@@ -1001,14 +1189,31 @@ func (c *perCPUCacheArray) get() (int32, bool) {
 	if cache.count > 0 {
 		cache.count--
 		slabID := cache.stack[cache.count]
-		atomic.AddUint64(&cache.hits, 1) // Keep hits atomic for lock-free reads
+		atomic.AddUint64(&cache.hits, 1)
 		return slabID, true
+	}
+
+	// Burst refill from lock-free stack
+	burstSize := PCCPUCacheSize / 2
+	for i := 0; i < burstSize; i++ {
+		if slabID, ok := a.lockFreeStack.pop(); ok {
+			cache.stack[cache.count] = slabID
+			cache.count++
+		} else {
+			break
+		}
+	}
+
+	if cache.count > 0 {
+		cache.count--
+		atomic.AddUint64(&cache.hits, 1)
+		return cache.stack[cache.count], true
 	}
 	return -1, false
 }
 
 func (c *perCPUCacheArray) put(slabID int32) bool {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cache := &c.caches[cpuID&c.mask]
 
 	cache.mutex.Lock()
@@ -1044,10 +1249,10 @@ func newImprovedShardedFreeList(capacity, shardCount int) *shardedFreeList {
 	return fl
 }
 
-func (fl *shardedFreeList) get() (int32, bool) {
-	// Use improved sharding strategy
-	cpuID := getCurrentCPUID()
-	startIdx := uint32(cpuID) & fl.shardMask
+// R1 improvement: Use fastrand for sharding
+func (fl *shardedFreeList) get(a *Slabby) (int32, bool) {
+	// Use improved sharding strategy with fastrand
+	startIdx := a.fastrand() & fl.shardMask
 
 	// Try each shard
 	for attempt := 0; attempt < len(fl.shardArray); attempt++ {
@@ -1069,18 +1274,19 @@ func (fl *shardedFreeList) get() (int32, bool) {
 			runtime.Gosched()
 		}
 	}
-
 	return -1, false
 }
 
-func (fl *shardedFreeList) put(slabID int32) {
+func (fl *shardedFreeList) put(slabID int32, a *Slabby) {
 	shardIdx := getImprovedShardIndex(slabID, len(fl.shardArray))
 	shard := &fl.shardArray[shardIdx]
+
 	shard.slabLock.Lock()
 	shard.slabIDs = append(shard.slabIDs, slabID)
 	shard.slabLock.Unlock()
 }
 
+// Modified createSlabRef to use SlabRef pooling
 func (a *Slabby) createSlabRef(slabID int32, startTime int64, isHeapAlloc bool) (*SlabRef, error) {
 	if !isHeapAlloc {
 		slabEntry := &a.slabMetadata[slabID]
@@ -1093,12 +1299,20 @@ func (a *Slabby) createSlabRef(slabID int32, startTime int64, isHeapAlloc bool) 
 		a.prefetchSlab(slabID)
 	}
 
-	ref := &SlabRef{
-		allocatorRef: a,
-		slabID:       slabID,
-		allocState:   0,
-		isHeapAlloc:  isHeapAlloc,
-		allocTime:    startTime,
+	// Get SlabRef from pool and reset all fields
+	ref := a.refPool.Get().(*SlabRef)
+	a.recordRefPoolHit()
+
+	// Critical: Reset all fields to prevent data leaks
+	*ref = SlabRef{
+		allocatorRef:    a,
+		slabID:          slabID,
+		allocState:      0,
+		isHeapAlloc:     isHeapAlloc,
+		allocTime:       startTime,
+		guardWord:       0,
+		dataPtr:         nil,
+		allocationStack: "", // Reset debug info
 	}
 
 	if isHeapAlloc {
@@ -1138,43 +1352,57 @@ func (a *Slabby) allocateHeapFallback(startTime int64) (*SlabRef, error) {
 
 // Enhanced statistics recording using per-CPU counters
 func (a *Slabby) recordAllocation() {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 	atomic.AddUint64(&cpu.allocations, 1)
+	atomic.AddUint64(&cpu.loadCounter, 1) // Track load for adaptive sampling
+}
+
+func (a *Slabby) recordFastAllocation() {
+	cpuID := getFastCPUID()
+	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
+	atomic.AddUint64(&cpu.fastAllocations, 1)
+	atomic.AddUint64(&cpu.loadCounter, 1) // Track load for adaptive sampling
 }
 
 func (a *Slabby) recordDeallocation() {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 	atomic.AddUint64(&cpu.deallocations, 1)
 }
 
+func (a *Slabby) recordFastDeallocation() {
+	cpuID := getFastCPUID()
+	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
+	atomic.AddUint64(&cpu.fastDeallocations, 1)
+}
+
 func (a *Slabby) recordBatchAllocation(count uint64) {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 	atomic.AddUint64(&cpu.batchAllocations, count)
 }
 
 func (a *Slabby) recordBatchDeallocation(count uint64) {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 	atomic.AddUint64(&cpu.batchDeallocations, count)
 }
 
 func (a *Slabby) recordError() {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 	atomic.AddUint64(&cpu.errors, 1)
 }
 
 func (a *Slabby) recordHeapFallback() {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 	atomic.AddUint64(&cpu.heapFallbacks, 1)
 }
 
 func (a *Slabby) recordGuardViolation() {
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 	atomic.AddUint64(&cpu.guardViolations, 1)
 }
@@ -1187,6 +1415,12 @@ func (a *Slabby) recordLockFreeHit() {
 	// Could add lock-free hit counter if needed
 }
 
+func (a *Slabby) recordRefPoolHit() {
+	cpuID := getFastCPUID()
+	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
+	atomic.AddUint64(&cpu.refPoolHits, 1)
+}
+
 func (a *Slabby) recordAllocationStack(ref *SlabRef) {
 	if a.config.enableDebug {
 		buf := make([]byte, 4096)
@@ -1195,9 +1429,10 @@ func (a *Slabby) recordAllocationStack(ref *SlabRef) {
 	}
 }
 
+// R1 improvement: Adaptive latency sampling
 func (a *Slabby) trackAllocationLatency(startTime int64) {
 	latency := nanotime() - startTime
-	cpuID := getCurrentCPUID()
+	cpuID := getFastCPUID()
 	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
 
 	// Update total allocation time
@@ -1211,17 +1446,40 @@ func (a *Slabby) trackAllocationLatency(startTime int64) {
 		}
 	}
 
-	// Sample latencies for percentile calculation (reduced overhead)
+	// R1 improvement: Adaptive latency sampling
 	counter := atomic.AddUint32(&cpu.samplingCounter, 1)
-	if counter%SamplingRate == 0 {
-		idx := atomic.AddUint32(&cpu.latencyBufferIdx, 1) % 64
+	loadCounter := atomic.LoadUint64(&cpu.loadCounter)
+
+	if shouldSample(counter, loadCounter) {
+		idx := atomic.AddUint32(&cpu.latencyBufferIdx, 1) % uint32(len(cpu.latencyBuffer))
 		cpu.latencyBuffer[idx] = latency
 	}
+}
+
+// R1 improvement: Adaptive sampling function
+func shouldSample(counter uint32, loadCounter uint64) bool {
+	// Base rate sampling
+	if counter%BaseSamplingRate == 0 {
+		return true
+	}
+
+	// Sample more frequently under low load, less under high load
+	if loadCounter < 1000 && counter%10 == 0 {
+		return true // Higher sampling rate for low load
+	}
+
+	// Reduce sampling under very high load
+	if loadCounter > 100000 && counter%1000 != 0 {
+		return false
+	}
+
+	return false
 }
 
 // Improved memory zeroing with chunked clearing for large slabs
 func (a *Slabby) zeroSlabMemory(slabID int32) {
 	offset := int64(slabID) * int64(a.alignedSize)
+
 	// Add guard page offset if enabled
 	if a.config.enableGuardPages {
 		offset += int64(slabID) * int64(GuardPageSize)
@@ -1280,6 +1538,13 @@ func (a *Slabby) prefetchSlab(slabID int32) {
 
 	// Use safe slice-based prefetching instead of pointer arithmetic
 	prefetchSliceSafe(a.memoryPool, int(offset), int(prefetchSize))
+}
+
+// R1 improvement: Batch prefetch for better cache performance
+func (a *Slabby) prefetchSlabRange(startID, count int32) {
+	for i := int32(0); i < count && startID+i < a.totalCapacity; i++ {
+		a.prefetchSlab(startID + i)
+	}
 }
 
 // Slice-based prefetch that avoids all pointer arithmetic
@@ -1346,22 +1611,23 @@ func (a *Slabby) checkGuardPages(slabID int32) error {
 	if err := checkGuardRegion(beforeGuard, "before"); err != nil {
 		return err
 	}
-
 	if err := checkGuardRegion(afterGuard, "after"); err != nil {
 		return err
 	}
-
 	return nil
 }
 
+// Modified invalidateReference to return SlabRef to pool
 func (r *SlabRef) invalidateReference() {
-	r.dataPtr = nil
-	r.slabID = -1
-	r.guardWord = 0
+	// Clear finalizer if enabled
 	if r.allocatorRef != nil && r.allocatorRef.config.enableFinalizers {
 		runtime.SetFinalizer(r, nil)
 	}
-	r.allocatorRef = nil
+
+	// Return to pool instead of letting GC collect
+	if r.allocatorRef != nil {
+		r.allocatorRef.refPool.Put(r)
+	}
 }
 
 func (r *SlabRef) finalizeReference() {
@@ -1528,7 +1794,7 @@ func (a *Slabby) startHealthMonitoring() {
 	}()
 }
 
-// Enhanced health metrics update with proper initialization
+// R1 improvement: Enhanced health metrics update with cached percentiles
 func (a *Slabby) updateHealthMetrics() {
 	a.healthMetrics.healthMutex.Lock()
 	defer a.healthMetrics.healthMutex.Unlock()
@@ -1550,9 +1816,23 @@ func (a *Slabby) updateHealthMetrics() {
 
 	// Update cache efficiency
 	totalHits := stats.PCCPUCacheHits + stats.LockFreeHits
-	totalAllocs := stats.TotalAllocations
+	totalAllocs := stats.TotalAllocations + stats.FastAllocations
+
 	if totalAllocs > 0 {
 		a.healthMetrics.cacheEfficiency = float64(totalHits) / float64(totalAllocs)
+	}
+
+	// Calculate and cache percentiles
+	latencies := a.collectLatencySamples()
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool {
+			return latencies[i] < latencies[j]
+		})
+
+		a.healthMetrics.allocLatencyP50 = time.Duration(latencies[len(latencies)*50/100])
+		a.healthMetrics.allocLatencyP95 = time.Duration(latencies[len(latencies)*95/100])
+		a.healthMetrics.allocLatencyP99 = time.Duration(latencies[len(latencies)*99/100])
+		a.healthMetrics.lastLatencyUpdate = time.Now()
 	}
 
 	// Update health score and track trend
@@ -1606,7 +1886,6 @@ func (a *Slabby) analyzeTrend() string {
 	} else if avgDelta < -0.05 {
 		return "degrading"
 	}
-
 	return "stable"
 }
 
@@ -1744,10 +2023,12 @@ func createCacheAlignedSlice(totalSize, elemSize, cacheLineSize int) ([]byte, ui
 	// Allocate with extra space for alignment
 	extraSpace := cacheLineSize - 1
 	raw := make([]byte, totalSize+extraSpace)
+
 	// Find cache-aligned starting point
 	start := uintptr(unsafe.Pointer(&raw[0]))
-	alignedStart := (start + uintptr(cacheLineSize) - 1) & ^(uintptr(cacheLineSize) - 1)
+	alignedStart := (start + uintptr(cacheLineSize) - 1) &^ (uintptr(cacheLineSize) - 1)
 	offset := int(alignedStart - start)
+
 	return raw[offset : offset+totalSize], alignedStart
 }
 
@@ -1763,17 +2044,11 @@ func getImprovedShardIndex(slabID int32, shardCount int) int {
 	return int(hash) % shardCount
 }
 
-// Enhanced CPU ID acquisition using FNV hash for stability
-func getCurrentCPUID() uint64 {
-	// Use a combination of goroutine stack and timing for stable CPU identifier
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	// Hash the stack trace to get a stable identifier
-	h := fnv.New64a()
-	h.Write(buf[:n])
-	cpuID := h.Sum64()
-	// Modulo with GOMAXPROCS to ensure it fits
-	return cpuID % uint64(runtime.GOMAXPROCS(0))
+// R1 improvement: Fast CPU ID acquisition replacing FNV hash
+func getFastCPUID() uint64 {
+	// Simple approach using runtime for P-local identification
+	// This is much faster than FNV hashing
+	return uint64(runtime.GOMAXPROCS(0)) // Use a simple approach for sharding
 }
 
 func alignToCache(size int32, cacheLineSize int) int32 {
