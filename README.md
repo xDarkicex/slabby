@@ -216,7 +216,7 @@ Ops/s: 2.8M 5.6M 11M  22M  43M  85M (theoretical)
 Enterprise Memory Management Pipeline
 
 ┌─────────────────────────────────────────────────────────┐
-│                 Application Layer                        │
+│                 Application Layer                       │
 ├─────────────────────────────────────────────────────────┤
 │ SlabRef Pool (Zero Allocation)    │ Health Monitor      │
 ├─────────────────────────────────────────────────────────┤
@@ -228,7 +228,7 @@ Enterprise Memory Management Pipeline
 ├─────────────────────────────────────────────────────────┤
 │ Heap Fallback (200ns+)            │ Audit Trail         │
 ├─────────────────────────────────────────────────────────┤
-│            Cache-Aligned Memory Pool                     │
+│            Cache-Aligned Memory Pool                    │
 └─────────────────────────────────────────────────────────┘
 ```
 
