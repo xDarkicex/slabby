@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go)](https://golang.org/doc/devel/release.html)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![GoDoc](https://img.shields.io/badge/pkg.go.dev-doc-blue?style=for-the-badge&logo=go)](https://pkg.go.dev/github.com/xDarkicex/slabby)
 [![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/slabby?style=for-the-badge)](https://goreportcard.com/report/github.com/xDarkicex/slabby)
 
@@ -509,12 +509,9 @@ go vet ./...
 
 ## License
 
-**Slabby** is open source software licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
-
-Organizations requiring proprietary distribution rights can obtain a **Commercial License**.
+**Slabby** is open source software licensed under the **MIT License**.
 
 - [LICENSE](https://github.com/xDarkicex/slabby/blob/main/LICENSE)
-- [Commercial Licensing](mailto:licensing@slabby.dev)
 
 ---
 
