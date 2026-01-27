@@ -13,6 +13,32 @@ import (
 	"unsafe"
 )
 
+// waitForDeallocationsToPropagate ensures released slabs are visible to allocators
+// This is necessary because lock-free data structures have eventual consistency
+func waitForDeallocationsToPropagate(t *testing.T, allocator *Slabby, expectedAvailable int, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		stats := allocator.Stats()
+		if stats.AvailableSlabs >= expectedAvailable {
+			// Add a small grace period to ensure lock-free structures are consistent
+			time.Sleep(5 * time.Millisecond)
+
+			// Double-check stats are still good
+			stats = allocator.Stats()
+			if stats.AvailableSlabs >= expectedAvailable {
+				t.Logf("Deallocations propagated: %d slabs available", stats.AvailableSlabs)
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("Timeout waiting for deallocations to propagate: expected %d available, got %d",
+		expectedAvailable, allocator.Stats().AvailableSlabs)
+}
+
 // Test constants
 const (
 	testSlabSize     = 1024
@@ -475,65 +501,6 @@ func TestHealthMetrics(t *testing.T) {
 	}
 }
 
-// TestCircuitBreaker tests circuit breaker functionality
-func TestCircuitBreaker(t *testing.T) {
-	// Create allocator with small capacity and circuit breaker
-	smallCapacity := 3
-	allocator, err := New(testSlabSize, smallCapacity,
-		WithHealthChecks(true),
-		WithCircuitBreaker(3, 50*time.Millisecond), // Higher threshold, shorter recovery
-	)
-	if err != nil {
-		t.Fatalf("Failed to create allocator: %v", err)
-	}
-	defer allocator.Close()
-
-	// Fill the allocator
-	refs := make([]*SlabRef, smallCapacity)
-	for i := 0; i < smallCapacity; i++ {
-		ref, err := allocator.Allocate()
-		if err != nil {
-			t.Fatalf("Failed to allocate: %v", err)
-		}
-		refs[i] = ref
-	}
-
-	// Trigger circuit breaker by causing multiple failures
-	for i := 0; i < 4; i++ {
-		_, err := allocator.Allocate()
-		if err != ErrOutOfMemory && err != ErrCircuitBreakerOpen {
-			t.Errorf("Expected ErrOutOfMemory or ErrCircuitBreakerOpen, got %v", err)
-		}
-	}
-
-	// At this point, circuit breaker should be open
-	_, err = allocator.Allocate()
-	if err != ErrCircuitBreakerOpen {
-		// It's possible we got ErrOutOfMemory if circuit breaker hasn't opened yet
-		// This is acceptable behavior
-		if err != ErrOutOfMemory {
-			t.Errorf("Expected ErrCircuitBreakerOpen or ErrOutOfMemory, got %v", err)
-		}
-	}
-
-	// Clean up and wait for recovery
-	for _, ref := range refs {
-		ref.Release()
-	}
-
-	// Wait for circuit breaker recovery
-	time.Sleep(100 * time.Millisecond)
-
-	// Should be able to allocate again
-	ref, err := allocator.Allocate()
-	if err != nil {
-		t.Errorf("Expected successful allocation after recovery, got %v", err)
-	}
-	if ref != nil {
-		ref.Release()
-	}
-}
-
 // TestConcurrentAccess tests thread-safety
 func TestConcurrentAccess(t *testing.T) {
 	allocator, err := New(testSlabSize, testCapacity*2) // Larger capacity for concurrent test
@@ -744,6 +711,217 @@ func TestHeapFallback(t *testing.T) {
 	if stats.HeapFallbacks == 0 {
 		t.Error("Expected heap fallback count > 0")
 	}
+}
+
+// TestCircuitBreaker tests the circuit breaker state machine behavior
+// Based on senior engineer guidance for robust testing of time-based state machines
+func TestCircuitBreaker(t *testing.T) {
+	// Use explicit logging to see what's happening
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug, // See all state transitions
+	}))
+
+	// Small capacity with explicit circuit breaker config
+	smallCapacity := 3
+	failureThreshold := int64(3)
+	recoveryTimeout := 50 * time.Millisecond
+
+	allocator, err := New(testSlabSize, smallCapacity,
+		WithHealthChecks(true),
+		WithCircuitBreaker(failureThreshold, recoveryTimeout),
+		WithLogger(logger),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create allocator: %v", err)
+	}
+	defer allocator.Close()
+
+	t.Log("=== Phase 1: Fill allocator to capacity ===")
+	refs := make([]*SlabRef, smallCapacity)
+	for i := 0; i < smallCapacity; i++ {
+		ref, err := allocator.Allocate()
+		if err != nil {
+			t.Fatalf("Failed to allocate slab %d: %v", i, err)
+		}
+		refs[i] = ref
+		t.Logf("Allocated slab %d (ID: %d)", i, ref.ID())
+	}
+
+	// Verify we're at capacity
+	stats := allocator.Stats()
+	t.Logf("Stats after fill: UsedSlabs=%d, AvailableSlabs=%d",
+		stats.UsedSlabs, stats.AvailableSlabs)
+
+	if stats.AvailableSlabs != 0 {
+		t.Errorf("Expected 0 available slabs, got %d", stats.AvailableSlabs)
+	}
+
+	t.Log("=== Phase 2: Trigger circuit breaker by causing failures ===")
+	// We need to cause exactly 'failureThreshold' failures to open the circuit
+	failureCount := 0
+	for i := 0; i < int(failureThreshold)+2; i++ { // +2 to be sure we exceed threshold
+		_, err := allocator.Allocate()
+
+		if err == ErrOutOfMemory {
+			failureCount++
+			t.Logf("Failure %d: Got ErrOutOfMemory (expected)", failureCount)
+		} else if err == ErrCircuitBreakerOpen {
+			t.Logf("Attempt %d: Circuit breaker is now open", i+1)
+			break
+		} else if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	if failureCount < int(failureThreshold) {
+		t.Fatalf("Expected at least %d failures, got %d", failureThreshold, failureCount)
+	}
+
+	t.Log("=== Phase 3: Verify circuit breaker is open ===")
+	// The circuit should be open now - verify it
+	_, err = allocator.Allocate()
+	if err != ErrCircuitBreakerOpen {
+		t.Errorf("Expected ErrCircuitBreakerOpen, got %v", err)
+	}
+
+	// Double-check via health metrics
+	health := allocator.HealthCheck()
+	if !health.CircuitBreakerOpen {
+		t.Error("HealthCheck should report circuit breaker as open")
+	}
+
+	t.Log("=== Phase 4: Release all references ===")
+	for i, ref := range refs {
+		if err := ref.Release(); err != nil {
+			t.Fatalf("Failed to release ref %d: %v", i, err)
+		}
+		t.Logf("Released slab %d (ID: %d)", i, ref.ID())
+	}
+
+	// CRITICAL FIX: Wait for deallocations to propagate through lock-free structures
+	// Lock-free data structures have eventual consistency. We need to ensure:
+	// 1. Slabs are marked as not in-use (for Stats)
+	// 2. Slabs are actually pushed to free lists (for Allocate)
+	// Use a SHORT timeout that won't trigger circuit breaker transition
+	// recoveryTimeout is 50ms, so use 30ms to be safe
+	t.Log("Waiting for deallocations to propagate through lock-free structures...")
+	deadline := time.Now().Add(30 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		stats := allocator.Stats()
+		if stats.AvailableSlabs >= smallCapacity {
+			// Stats show slabs available, add grace period for lock-free operations
+			time.Sleep(15 * time.Millisecond)
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Verify slabs are actually available now
+	statsAfterRelease := allocator.Stats()
+	t.Logf("Stats after release: UsedSlabs=%d, AvailableSlabs=%d",
+		statsAfterRelease.UsedSlabs, statsAfterRelease.AvailableSlabs)
+
+	if statsAfterRelease.AvailableSlabs != smallCapacity {
+		t.Fatalf("Expected %d available slabs after release, got %d",
+			smallCapacity, statsAfterRelease.AvailableSlabs)
+	}
+
+	// Verify circuit breaker is still open before recovery timeout
+	_, err = allocator.Allocate()
+	if err != ErrCircuitBreakerOpen {
+		t.Fatalf("Expected ErrCircuitBreakerOpen before recovery, got %v", err)
+	}
+
+	t.Log("=== Phase 5: Wait for circuit breaker recovery ===")
+	// Wait for the recovery timeout to elapse from the last failure
+	// Use 2x recovery timeout to ensure we're well past the threshold
+	sleepDuration := recoveryTimeout * 2
+	t.Logf("Sleeping for %v (2x recovery timeout of %v)", sleepDuration, recoveryTimeout)
+	time.Sleep(sleepDuration)
+
+	t.Log("=== Phase 6: Verify circuit breaker allows requests (half-open state) ===")
+	// The FIRST allocation after timeout should:
+	// 1. Trigger transition from OPEN -> HALF-OPEN
+	// 2. Be allowed through (because half-open returns false)
+	// 3. Succeed (because slabs are available)
+	ref, err := allocator.Allocate()
+	if err != nil {
+		// If this fails, we need detailed diagnostics
+		health := allocator.HealthCheck()
+		stats := allocator.Stats()
+
+		t.Errorf("First allocation after recovery failed: %v", err)
+		t.Logf("Circuit breaker open: %v", health.CircuitBreakerOpen)
+		t.Logf("Available slabs: %d/%d", stats.AvailableSlabs, stats.TotalSlabs)
+		t.Logf("Used slabs: %d", stats.UsedSlabs)
+
+		// Check internal circuit breaker state
+		if allocator.circuitBreaker != nil {
+			allocator.circuitBreaker.stateMutex.RLock()
+			state := atomic.LoadInt32(&allocator.circuitBreaker.currentState)
+			failCount := allocator.circuitBreaker.failureCount
+			succCount := allocator.circuitBreaker.successCount
+			lastFailTime := allocator.circuitBreaker.lastFailureTime
+			allocator.circuitBreaker.stateMutex.RUnlock()
+
+			stateStr := "unknown"
+			switch state {
+			case circuitClosed:
+				stateStr = "closed"
+			case circuitOpen:
+				stateStr = "open"
+			case circuitHalfOpen:
+				stateStr = "half-open"
+			}
+
+			t.Logf("Circuit breaker state: %s", stateStr)
+			t.Logf("Failure count: %d, Success count: %d", failCount, succCount)
+			t.Logf("Time since last failure: %v", time.Since(lastFailTime))
+		}
+
+		t.FailNow()
+	}
+
+	t.Logf("Successfully allocated after recovery (ID: %d)", ref.ID())
+
+	// This successful allocation should increment successCount in half-open state
+	// Release it immediately
+	if err := ref.Release(); err != nil {
+		t.Fatalf("Failed to release first recovery allocation: %v", err)
+	}
+
+	t.Log("=== Phase 7: Make more allocations to close circuit ===")
+	// Need threshold/2 successes to close circuit
+	// We already had 1, need (threshold/2 - 1) more
+	neededSuccesses := int(failureThreshold/2) - 1
+	t.Logf("Need %d more successful allocations to close circuit", neededSuccesses)
+
+	for i := 0; i < neededSuccesses; i++ {
+		ref, err := allocator.Allocate()
+		if err != nil {
+			t.Fatalf("Allocation %d failed during recovery: %v", i+1, err)
+		}
+		t.Logf("Recovery allocation %d succeeded (ID: %d)", i+1, ref.ID())
+		ref.Release()
+	}
+
+	t.Log("=== Phase 8: Verify circuit breaker is now closed ===")
+	health = allocator.HealthCheck()
+	if health.CircuitBreakerOpen {
+		t.Error("Circuit breaker should be closed after successful recovery")
+	}
+
+	// Final allocation should work without any circuit breaker involvement
+	finalRef, err := allocator.Allocate()
+	if err != nil {
+		t.Errorf("Final allocation failed: %v", err)
+	}
+	if finalRef != nil {
+		t.Logf("Final allocation succeeded (ID: %d)", finalRef.ID())
+		finalRef.Release()
+	}
+
+	t.Log("=== Test completed successfully ===")
 }
 
 // Benchmark tests
