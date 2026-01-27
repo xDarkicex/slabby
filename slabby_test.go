@@ -748,7 +748,8 @@ func TestHeapFallback(t *testing.T) {
 
 // Benchmark tests
 func BenchmarkAllocate(b *testing.B) {
-	allocator, err := New(benchSlabSize, benchCapacity)
+	// Use large capacity to prevent exhaustion during parallel benchmark
+	allocator, err := New(benchSlabSize, benchCapacity*10)
 	if err != nil {
 		b.Fatalf("Failed to create allocator: %v", err)
 	}
@@ -786,7 +787,8 @@ func BenchmarkBatchAllocate(b *testing.B) {
 }
 
 func BenchmarkAllocateDeallocate(b *testing.B) {
-	allocator, err := New(benchSlabSize, benchCapacity)
+	// Use large capacity to prevent exhaustion during parallel benchmark
+	allocator, err := New(benchSlabSize, benchCapacity*10)
 	if err != nil {
 		b.Fatalf("Failed to create allocator: %v", err)
 	}
@@ -794,35 +796,24 @@ func BenchmarkAllocateDeallocate(b *testing.B) {
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		refs := make([]*SlabRef, 0, 100)
-
 		for pb.Next() {
-			// Allocate
+			// Allocate and immediately deallocate - per-CPU cache hit path
 			ref, err := allocator.Allocate()
 			if err != nil {
 				b.Fatalf("Allocation failed: %v", err)
 			}
-			refs = append(refs, ref)
-
-			// Occasionally deallocate to prevent OOM
-			if len(refs) >= 50 {
-				for _, r := range refs {
-					r.Release()
-				}
-				refs = refs[:0]
+			// Deallocate immediately to test cache hit rate
+			if err := ref.Release(); err != nil {
+				b.Fatalf("Deallocation failed: %v", err)
 			}
-		}
-
-		// Clean up remaining
-		for _, r := range refs {
-			r.Release()
 		}
 	})
 }
 
 func BenchmarkCompareWithMake(b *testing.B) {
 	b.Run("SlabAllocator", func(b *testing.B) {
-		allocator, err := New(benchSlabSize, benchCapacity)
+		// Use large capacity to prevent exhaustion
+		allocator, err := New(benchSlabSize, benchCapacity*10)
 		if err != nil {
 			b.Fatalf("Failed to create allocator: %v", err)
 		}
