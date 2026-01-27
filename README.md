@@ -280,7 +280,7 @@ Size=8KB      6,893,010    36.33 ns/op    0 B/op    0 allocs/op
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Throughput** | 43-48M ops/sec | Fast path with per-CPU cache (tracking OFF) |
+| **Throughput** | 32-48M ops/sec | Updated performance (tracking OFF) |
 | **Latency (P50)** | 20-23 ns | Sub-25ns for most operations (tracking OFF) |
 | **Latency (P99)** | ~35-40 ns | Larger sizes still under 50ns |
 | **Cache Hit Rate** | 95%+ | With stable goroutine affinity |
@@ -291,15 +291,15 @@ Size=8KB      6,893,010    36.33 ns/op    0 B/op    0 allocs/op
 ### Comparison with Go's make()
 
 ```
-SlabAllocator:  116.1 ns/op    0 B/op    0 allocs/op    No GC pressure ✅
-StandardMake:     0.30 ns/op    0 B/op    0 allocs/op    Triggers GC ⚠️
+SlabAllocator:      21.14 ns/op    0 B/op    0 allocs/op    No GC pressure ✅
+StandardMake:        0.55 ns/op    0 B/op    0 allocs/op    Triggers GC ⚠️
 ```
 
 **Key Insights:**
-- **22% faster** with per-CPU cache vs lock-free stack
-- **Size-independent** performance (31-36ns across all sizes)
-- **Predictable latency** - no GC pauses or allocation spikes
+- Go's `make()` is **38x faster** for single allocations
 - **Zero GC pressure** - ideal for latency-sensitive applications
+- **Predictable latency** - no GC pauses or allocation spikes
+- **Size-independent** performance (20-36ns across all sizes)
 
 **When to Use Slabby:**
 - ✅ High-frequency allocations (millions/sec)
