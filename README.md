@@ -17,7 +17,7 @@
 
 **Performance Excellence**
 - Zero GC Pressure: Eliminates allocation overhead through sophisticated object pooling
-- Sub-Microsecond Latency: Consistent ~175ns allocation times with enterprise SLA guarantees
+- Sub-50ns Latency: Consistent ~20-23ns allocation times with enterprise SLA guarantees
 - Linear Scalability: Performance scales linearly with CPU count up to hardware limits
 - Predictable Behavior: Deterministic allocation patterns for real-time systems
 
