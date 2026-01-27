@@ -1,4 +1,4 @@
-# Slabby Enterprise - Zero-Allocation Slab Allocator for Go
+# Slabby - Zero-Allocation Slab Allocator for Go
 
 <div align="center">
 
@@ -9,19 +9,19 @@
 
 </div>
 
-**Slabby Enterprise** is a production-grade, zero-allocation slab allocator engineered for mission-critical Go applications requiring predictable memory allocation patterns, enterprise-level security, and comprehensive observability.
+**Slabby** is a zero-allocation slab allocator for Go with enterprise-grade features, designed for high-performance applications requiring predictable memory allocation patterns.
 
 > **🚀 Achievement: Zero Allocations** - Slabby achieves true zero-allocation performance through advanced SlabRef pooling and lock-free data structures, delivering enterprise-grade memory management without garbage collection overhead.
 
-## Enterprise Value Proposition
+## Key Features
 
 **Performance Excellence**
 - Zero GC Pressure: Eliminates allocation overhead through sophisticated object pooling
-- Sub-50ns Latency: Consistent ~20-23ns allocation times with enterprise SLA guarantees
+- Sub-50ns Latency: Consistent ~20-23ns allocation times with predictable performance
 - Linear Scalability: Performance scales linearly with CPU count up to hardware limits
 - Predictable Behavior: Deterministic allocation patterns for real-time systems
 
-**Enterprise Security**
+**Security Features**
 - Memory Isolation: Automatic memory zeroing prevents data leakage between allocations
 - Buffer Overflow Detection: OS-level guard pages provide immediate overflow protection
 - Corruption Detection: Runtime validation prevents use-after-free and double-free vulnerabilities
@@ -38,7 +38,7 @@
 
 - [Installation & Quick Start](#installation--quick-start)
 - [Core API](#core-api)
-- [Enterprise Features](#enterprise-features)
+- [Advanced Features](#advanced-features)
   - [Health Monitoring & Graceful Degradation](#health-monitoring--graceful-degradation)
   - [Leak Detection](#leak-detection)
 - [Performance Benchmarks](#performance-benchmarks)
@@ -150,7 +150,7 @@ func (r *SlabRef) ID() int32                     // Debug identifier
 func (r *SlabRef) AllocationStack() string       // Stack trace (when debug enabled)
 ```
 
-## Enterprise Features
+## Advanced Features
 
 ### Health Monitoring & Graceful Degradation
 
@@ -354,7 +354,7 @@ WithPCPUCache(enabled bool)     // Per-CPU optimization (default: true)
 WithMaxAllocLatency(duration)   // SLA enforcement threshold
 ```
 
-#### Enterprise Security
+#### Security Options
 ```go
 WithSecure()                    // Memory zeroing (GDPR/HIPAA compliance)
 WithBitGuard()                  // Corruption detection (minimal overhead)
@@ -364,7 +364,7 @@ WithFinalizers()                // Memory leak detection (development only)
 
 #### Reliability Features
 ```go
-WithHealthChecks(enabled bool)              // Enterprise monitoring
+WithHealthChecks(enabled bool)              // Built-in monitoring
 WithCircuitBreaker(threshold, timeout)     // Fault tolerance
 WithHeapFallback()                         // Service continuity
 ```
@@ -515,4 +515,4 @@ go vet ./...
 
 ---
 
-**Slabby Enterprise** - *Zero-allocation performance with enterprise reliability.*
+**Slabby** - *Zero-allocation slab allocator for Go.*
