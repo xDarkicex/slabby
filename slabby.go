@@ -219,9 +219,9 @@ type Slabby struct {
 	guardPages   []byte  // Guard pages for memory protection
 
 	// High-performance allocation structures
-	perCPUCache   *perCPUCacheArray
-	lockFreeStack *lockFreeStack
-	shardedLists  *shardedFreeList
+	perCPUCache  *perCPUCacheArray
+	freeStack    *indexedFreeStack
+	shardedLists *shardedFreeList
 
 	// Configuration and options
 	config allocatorConfig
@@ -253,23 +253,18 @@ type SecureAllocator struct {
 	*Slabby
 }
 
-// Optimized metadata structure with cache line alignment
+// Compact per-slab metadata. Keep this lean because it is paid once per slot.
 type slabMetadata struct {
-	inUse     atomic.Bool
-	slabID    int32
-	guardPage bool                        // Has guard pages
-	_         [DefaultCacheLine - 12]byte // Padding to cache line size
+	inUse atomic.Bool
 }
 
-// Lock-free stack node
-type slabNode struct {
-	slabID int32
-	next   *slabNode
-}
-
-// Lock-free stack implementation using atomic.Pointer
-type lockFreeStack struct {
-	head atomic.Pointer[slabNode]
+// indexedFreeStack is a preallocated LIFO free stack.
+// It trades a little synchronization simplicity for dramatically lower
+// reserved memory than pointer-node based stacks.
+type indexedFreeStack struct {
+	mu    sync.Mutex
+	slab  []int32
+	count int
 }
 
 // Per-CPU cache array for minimal cross-CPU communication
@@ -286,18 +281,16 @@ type pcpuCacheEntry struct {
 	hits  uint64                 // Cache hit counter (atomic)
 }
 
-// Sharded free list with improved distribution
+// Sharded free list with improved distribution.
 type shardedFreeList struct {
 	shardArray []freeListShard
 	shardMask  uint32
 }
 
-// Lock-free sharded free list entry using atomic operations
 type freeListShard struct {
-	_       [DefaultCacheLine]byte    // Cache line padding
-	slabIDs []int32                   // Local cache of slab IDs
-	head    atomic.Pointer[shardNode] // Lock-free stack head
-	count   int32                     // Number of items in shard (atomic)
+	mu      sync.Mutex
+	slabIDs []int32
+	count   int
 }
 
 type shardNode struct {
@@ -419,12 +412,7 @@ func New(slabSize, capacity int, options ...AllocatorOption) (*Slabby, error) {
 		memoryPool = memoryPool[:len(memoryPool)-int(guardPageMemory)]
 	}
 
-	// Initialize separated metadata array for better cache efficiency
 	slabMetadata := make([]slabMetadata, capacity)
-	for i := range slabMetadata {
-		slabMetadata[i].slabID = int32(i)
-		slabMetadata[i].guardPage = config.enableGuardPages
-	}
 
 	// Initialize per-CPU cache array
 	var perCPUCache *perCPUCacheArray
@@ -437,8 +425,7 @@ func New(slabSize, capacity int, options ...AllocatorOption) (*Slabby, error) {
 		}
 	}
 
-	// Initialize lock-free stack
-	lockFreeStack := &lockFreeStack{}
+	freeStack := newIndexedFreeStack(capacity)
 
 	// Initialize sharded free list
 	shardCount := config.shardCount
@@ -470,7 +457,7 @@ func New(slabSize, capacity int, options ...AllocatorOption) (*Slabby, error) {
 		memoryBase:     memoryBase,
 		guardPages:     guardPages,
 		perCPUCache:    perCPUCache,
-		lockFreeStack:  lockFreeStack,
+		freeStack:      freeStack,
 		shardedLists:   shardedLists,
 		config:         config,
 		cpuStats:       cpuStats,
@@ -550,7 +537,7 @@ func (a *Slabby) Allocate() (*SlabRef, error) {
 
 	// Try lock-free stack (fast path with single source of truth)
 	for {
-		slabID, ok := a.lockFreeStack.pop()
+		slabID, ok := a.freeStack.pop()
 		if !ok {
 			break
 		}
@@ -630,7 +617,7 @@ func (a *Slabby) AllocateFast() ([]byte, int32, error) {
 
 	// Try lock-free stack (fast path)
 	for {
-		slabID, ok := a.lockFreeStack.pop()
+		slabID, ok := a.freeStack.pop()
 		if !ok {
 			break
 		}
@@ -699,7 +686,7 @@ func (a *Slabby) DeallocateFast(slabID int32) error {
 	// Return to appropriate pool
 	if a.config.enablePCPUCache && a.perCPUCache.put(slabID) {
 		// Success
-	} else if !a.lockFreeStack.push(slabID) {
+	} else if !a.freeStack.push(slabID) {
 		a.shardedLists.put(slabID, a)
 	}
 
@@ -750,7 +737,7 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 
 	// Try lock-free stack for remaining
 	for len(refs) < count {
-		if slabID, ok := a.lockFreeStack.pop(); ok {
+		if slabID, ok := a.freeStack.pop(); ok {
 			ref, err := a.createSlabRef(slabID, startTime, false)
 			if err != nil {
 				break
@@ -880,7 +867,7 @@ func (a *Slabby) Deallocate(ref *SlabRef) error {
 	// Return to the most appropriate pool
 	if a.config.enablePCPUCache && a.perCPUCache.put(slabID) {
 		// Successfully returned to per-CPU cache
-	} else if !a.lockFreeStack.push(slabID) {
+	} else if !a.freeStack.push(slabID) {
 		// Fall back to sharded return
 		a.shardedLists.put(slabID, a)
 	}
@@ -1057,9 +1044,16 @@ func (a *Slabby) memoryStatsSnapshot() MemoryStats {
 		reservedMetaBytes += int64(unsafe.Sizeof(*a.perCPUCache))
 		reservedMetaBytes += int64(len(a.perCPUCache.caches)) * int64(unsafe.Sizeof(pcpuCacheEntry{}))
 	}
+	if a.freeStack != nil {
+		reservedMetaBytes += int64(unsafe.Sizeof(*a.freeStack))
+		reservedMetaBytes += int64(len(a.freeStack.slab)) * int64(unsafe.Sizeof(int32(0)))
+	}
 	if a.shardedLists != nil {
 		reservedMetaBytes += int64(unsafe.Sizeof(*a.shardedLists))
 		reservedMetaBytes += int64(len(a.shardedLists.shardArray)) * int64(unsafe.Sizeof(freeListShard{}))
+		for i := range a.shardedLists.shardArray {
+			reservedMetaBytes += int64(len(a.shardedLists.shardArray[i].slabIDs)) * int64(unsafe.Sizeof(int32(0)))
+		}
 	}
 
 	liveBytes := int64(usedSlabs) * int64(a.slabSize)
@@ -1172,13 +1166,16 @@ func (a *Slabby) Reset() {
 		}
 	}
 
-	a.lockFreeStack.head.Store(nil)
+	a.freeStack.reset()
 
 	// Properly reinitialize sharded lists with all slabs
 	capacity := int(a.totalCapacity)
 	shardCount := len(a.shardedLists.shardArray)
 
-	// Clear existing lists and redistribute all slabs atomically
+	for i := range a.shardedLists.shardArray {
+		a.shardedLists.shardArray[i].reset()
+	}
+
 	for i := 0; i < capacity; i++ {
 		shardIdx := getImprovedShardIndex(int32(i), shardCount)
 		shard := &a.shardedLists.shardArray[shardIdx]
@@ -1316,28 +1313,39 @@ func (a *Slabby) getSlabBytes(slabID int32) []byte {
 	return a.memoryPool[offset : offset+int64(a.slabSize)]
 }
 
-// Lock-free stack operations
-func (s *lockFreeStack) push(slabID int32) bool {
-	node := &slabNode{slabID: slabID}
-	for {
-		oldHead := s.head.Load()
-		node.next = oldHead
-		if s.head.CompareAndSwap(oldHead, node) {
-			return true
-		}
+func newIndexedFreeStack(capacity int) *indexedFreeStack {
+	return &indexedFreeStack{
+		slab: make([]int32, capacity),
 	}
 }
 
-func (s *lockFreeStack) pop() (int32, bool) {
-	for {
-		oldHead := s.head.Load()
-		if oldHead == nil {
-			return -1, false
-		}
-		if s.head.CompareAndSwap(oldHead, oldHead.next) {
-			return oldHead.slabID, true
-		}
+func (s *indexedFreeStack) push(slabID int32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.count >= len(s.slab) {
+		return false
 	}
+	s.slab[s.count] = slabID
+	s.count++
+	return true
+}
+
+func (s *indexedFreeStack) pop() (int32, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.count == 0 {
+		return -1, false
+	}
+	s.count--
+	return s.slab[s.count], true
+}
+
+func (s *indexedFreeStack) reset() {
+	s.mu.Lock()
+	s.count = 0
+	s.mu.Unlock()
 }
 
 // Lock-free per-CPU cache operations using atomic CAS
@@ -1389,7 +1397,7 @@ func (c *perCPUCacheArray) get(a *Slabby) (int32, bool) {
 
 	// Cache is empty - refill from lock-free stack
 	// Try to get a slab and add to cache using put protocol
-	slabID, ok := a.lockFreeStack.pop()
+	slabID, ok := a.freeStack.pop()
 	if !ok {
 		return -1, false
 	}
@@ -1400,7 +1408,7 @@ func (c *perCPUCacheArray) get(a *Slabby) (int32, bool) {
 	}
 
 	// putInternal failed (cache full), push back to stack
-	a.lockFreeStack.push(slabID)
+	a.freeStack.push(slabID)
 	return -1, false
 }
 
@@ -1432,41 +1440,34 @@ func (c *perCPUCacheArray) put(slabID int32) bool {
 	return c.putInternal(cache, slabID)
 }
 
-// Lock-free sharded free list methods for freeListShard
 func (s *freeListShard) push(slabID int32) {
-	node := &shardNode{slabID: slabID}
-	for {
-		oldHead := s.head.Load()
-		node.next = oldHead
-		if s.head.CompareAndSwap(oldHead, node) {
-			atomic.AddInt32(&s.count, 1)
-			return
-		}
-	}
+	s.mu.Lock()
+	s.slabIDs[s.count] = slabID
+	s.count++
+	s.mu.Unlock()
 }
 
 func (s *freeListShard) pop() (int32, bool) {
-	for {
-		oldHead := s.head.Load()
-		if oldHead == nil {
-			return -1, false
-		}
-		if s.head.CompareAndSwap(oldHead, oldHead.next) {
-			atomic.AddInt32(&s.count, -1)
-			return oldHead.slabID, true
-		}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.count == 0 {
+		return -1, false
 	}
+	s.count--
+	return s.slabIDs[s.count], true
 }
 
 func (s *freeListShard) tryPop() (int32, bool) {
-	count := atomic.LoadInt32(&s.count)
-	if count <= 0 {
-		return -1, false
-	}
 	return s.pop()
 }
 
-// Improved sharded free list - lock-free initialization
+func (s *freeListShard) reset() {
+	s.mu.Lock()
+	s.count = 0
+	s.mu.Unlock()
+}
+
 func newImprovedShardedFreeList(capacity, shardCount int) *shardedFreeList {
 	actualShardCount := nextPowerOfTwo(uint32(shardCount))
 	mask := actualShardCount - 1
@@ -1476,7 +1477,20 @@ func newImprovedShardedFreeList(capacity, shardCount int) *shardedFreeList {
 		shardMask:  mask,
 	}
 
-	// Distribute slabs across shards with better locality using lock-free push
+	for i := 0; i < capacity; i++ {
+		shardIdx := getImprovedShardIndex(int32(i), int(actualShardCount))
+		fl.shardArray[shardIdx].count++
+	}
+
+	for i := range fl.shardArray {
+		shard := &fl.shardArray[i]
+		if shard.count == 0 {
+			continue
+		}
+		shard.slabIDs = make([]int32, shard.count)
+		shard.count = 0
+	}
+
 	for i := 0; i < capacity; i++ {
 		shardIdx := getImprovedShardIndex(int32(i), int(actualShardCount))
 		shard := &fl.shardArray[shardIdx]
@@ -1486,12 +1500,9 @@ func newImprovedShardedFreeList(capacity, shardCount int) *shardedFreeList {
 	return fl
 }
 
-// R1 improvement: Use fastrand for sharding with lock-free per-shard access
 func (fl *shardedFreeList) get(a *Slabby) (int32, bool) {
-	// Use improved sharding strategy with fastrand
 	startIdx := a.fastrand() & fl.shardMask
 
-	// Try each shard with lock-free pop
 	for attempt := 0; attempt < len(fl.shardArray); attempt++ {
 		shardIdx := (startIdx + uint32(attempt)) & fl.shardMask
 		shard := &fl.shardArray[shardIdx]
