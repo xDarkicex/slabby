@@ -490,6 +490,40 @@ func BenchmarkMmapOpsHybridAllocation(b *testing.B) {
 }
 
 // =============================================================================
+// Slot API Benchmarks
+// =============================================================================
+
+func BenchmarkSlotArenaOpsVsFastAllocate(b *testing.B) {
+	b.Run("FastAllocate", func(b *testing.B) {
+		slab, _ := New(1024, 10000)
+		defer slab.Close()
+
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				data, id, _ := slab.AllocateFast()
+				_ = data
+				slab.DeallocateFast(id)
+			}
+		})
+	})
+
+	b.Run("SlotArena", func(b *testing.B) {
+		arena, _ := NewSlotArena(1024, 10000)
+		defer arena.Close()
+
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				slot, data, _ := arena.AllocateSlot()
+				_ = data
+				arena.FreeSlot(slot)
+			}
+		})
+	})
+}
+
+// =============================================================================
 // Handle API Benchmarks
 // =============================================================================
 

@@ -139,6 +139,13 @@ type AllocatorStats struct {
 	TotalSlabs          int     `json:"total_slabs"`
 	UsedSlabs           int     `json:"used_slabs"`
 	AvailableSlabs      int     `json:"available_slabs"`
+	ReservedBytes       int64   `json:"reserved_bytes"`
+	ReservedDataBytes   int64   `json:"reserved_data_bytes"`
+	ReservedMetaBytes   int64   `json:"reserved_meta_bytes"`
+	ReservedGuardBytes  int64   `json:"reserved_guard_bytes"`
+	LiveBytes           int64   `json:"live_bytes"`
+	FreeBytes           int64   `json:"free_bytes"`
+	CapacityUtilization float64 `json:"capacity_utilization"`
 	TotalAllocations    uint64  `json:"total_allocations"`
 	TotalDeallocations  uint64  `json:"total_deallocations"`
 	CurrentAllocations  uint64  `json:"current_allocations"`
@@ -160,6 +167,21 @@ type AllocatorStats struct {
 	LockFreeHits        uint64  `json:"lock_free_hits"`
 	GuardPageViolations uint64  `json:"guard_page_violations"`
 	RefPoolHits         uint64  `json:"ref_pool_hits"` // New metric
+}
+
+// MemoryStats separates reserved allocator capacity from live payload usage.
+// This is useful for systems that need to compare reserved backing memory with
+// the bytes currently in use by live records.
+type MemoryStats struct {
+	ReservedBytes       int64   `json:"reserved_bytes"`
+	ReservedDataBytes   int64   `json:"reserved_data_bytes"`
+	ReservedMetaBytes   int64   `json:"reserved_meta_bytes"`
+	ReservedGuardBytes  int64   `json:"reserved_guard_bytes"`
+	LiveBytes           int64   `json:"live_bytes"`
+	FreeBytes           int64   `json:"free_bytes"`
+	UsedSlabs           int     `json:"used_slabs"`
+	FreeSlabs           int     `json:"free_slabs"`
+	CapacityUtilization float64 `json:"capacity_utilization"`
 }
 
 // HealthMetrics provides detailed health and performance information.
@@ -907,16 +929,9 @@ func (a *Slabby) Stats() *AllocatorStats {
 	a.statsMu.Lock()
 	defer a.statsMu.Unlock()
 
-	// Count actual in-use slabs from metadata (source of truth)
-	// This is the real count, not derived from potentially inconsistent counters
-	var usedSlabs int
-	for i := int32(0); i < a.totalCapacity; i++ {
-		if a.slabMetadata[i].inUse.Load() {
-			usedSlabs++
-		}
-	}
-
-	availableSlabs := int(a.totalCapacity) - usedSlabs
+	memoryStats := a.memoryStatsSnapshot()
+	usedSlabs := memoryStats.UsedSlabs
+	availableSlabs := memoryStats.FreeSlabs
 
 	// Aggregate per-CPU statistics for non-critical metrics
 	var totalAllocs, totalDeallocs, totalAllocTime uint64
@@ -959,9 +974,8 @@ func (a *Slabby) Stats() *AllocatorStats {
 		usedSlabs = int(a.totalCapacity)
 	}
 
-	fragmentation := 1.0 - (float64(usedSlabs)*float64(a.slabSize))/
-		float64(a.alignedSize*a.totalCapacity)
-	memoryUtil := float64(usedSlabs) / float64(a.totalCapacity)
+	fragmentation := 1.0 - (float64(memoryStats.LiveBytes) / float64(memoryStats.ReservedDataBytes))
+	memoryUtil := memoryStats.CapacityUtilization
 
 	// Clamp values to valid ranges
 	if fragmentation < 0 {
@@ -987,6 +1001,13 @@ func (a *Slabby) Stats() *AllocatorStats {
 		TotalSlabs:          int(a.totalCapacity),
 		UsedSlabs:           usedSlabs,
 		AvailableSlabs:      availableSlabs,
+		ReservedBytes:       memoryStats.ReservedBytes,
+		ReservedDataBytes:   memoryStats.ReservedDataBytes,
+		ReservedMetaBytes:   memoryStats.ReservedMetaBytes,
+		ReservedGuardBytes:  memoryStats.ReservedGuardBytes,
+		LiveBytes:           memoryStats.LiveBytes,
+		FreeBytes:           memoryStats.FreeBytes,
+		CapacityUtilization: memoryStats.CapacityUtilization,
 		TotalAllocations:    totalAllocs,
 		TotalDeallocations:  totalDeallocs,
 		CurrentAllocations:  uint64(usedSlabs),
@@ -1008,6 +1029,56 @@ func (a *Slabby) Stats() *AllocatorStats {
 		LockFreeHits:        lockFreeHits,
 		GuardPageViolations: totalGuardViolations,
 		RefPoolHits:         totalRefPoolHits,
+	}
+}
+
+// MemoryStats reports reserved allocator capacity separately from live payload
+// usage so callers can distinguish backing reservation from bytes actively in use.
+func (a *Slabby) MemoryStats() MemoryStats {
+	return a.memoryStatsSnapshot()
+}
+
+func (a *Slabby) memoryStatsSnapshot() MemoryStats {
+	var usedSlabs int
+	for i := int32(0); i < a.totalCapacity; i++ {
+		if a.slabMetadata[i].inUse.Load() {
+			usedSlabs++
+		}
+	}
+
+	freeSlabs := int(a.totalCapacity) - usedSlabs
+	reservedDataBytes := int64(a.alignedSize) * int64(a.totalCapacity)
+	reservedGuardBytes := int64(len(a.guardPages))
+	reservedMetaBytes := int64(len(a.slabMetadata)) * int64(unsafe.Sizeof(slabMetadata{}))
+	reservedMetaBytes += int64(len(a.cpuStats)) * int64(unsafe.Sizeof(cpuStatEntry{}))
+	reservedMetaBytes += int64(unsafe.Sizeof(*a))
+
+	if a.perCPUCache != nil {
+		reservedMetaBytes += int64(unsafe.Sizeof(*a.perCPUCache))
+		reservedMetaBytes += int64(len(a.perCPUCache.caches)) * int64(unsafe.Sizeof(pcpuCacheEntry{}))
+	}
+	if a.shardedLists != nil {
+		reservedMetaBytes += int64(unsafe.Sizeof(*a.shardedLists))
+		reservedMetaBytes += int64(len(a.shardedLists.shardArray)) * int64(unsafe.Sizeof(freeListShard{}))
+	}
+
+	liveBytes := int64(usedSlabs) * int64(a.slabSize)
+	freeBytes := reservedDataBytes - liveBytes
+	utilization := 0.0
+	if a.totalCapacity > 0 {
+		utilization = float64(usedSlabs) / float64(a.totalCapacity)
+	}
+
+	return MemoryStats{
+		ReservedBytes:       reservedDataBytes + reservedMetaBytes + reservedGuardBytes,
+		ReservedDataBytes:   reservedDataBytes,
+		ReservedMetaBytes:   reservedMetaBytes,
+		ReservedGuardBytes:  reservedGuardBytes,
+		LiveBytes:           liveBytes,
+		FreeBytes:           freeBytes,
+		UsedSlabs:           usedSlabs,
+		FreeSlabs:           freeSlabs,
+		CapacityUtilization: utilization,
 	}
 }
 
