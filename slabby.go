@@ -1442,6 +1442,18 @@ func (c *perCPUCacheArray) put(slabID int32) bool {
 
 func (s *freeListShard) push(slabID int32) {
 	s.mu.Lock()
+	if s.count >= len(s.slabIDs) {
+		// Rebalance overflow: get() uses random probing which can drain
+		// a different shard than put() routes to via getImprovedShardIndex.
+		// Grow the array so the shard can absorb redistribution.
+		newCap := len(s.slabIDs) * 2
+		if newCap < 16 {
+			newCap = 16
+		}
+		newSlabIDs := make([]int32, newCap)
+		copy(newSlabIDs, s.slabIDs)
+		s.slabIDs = newSlabIDs
+	}
 	s.slabIDs[s.count] = slabID
 	s.count++
 	s.mu.Unlock()
@@ -1520,6 +1532,25 @@ func (fl *shardedFreeList) get(a *Slabby) (int32, bool) {
 }
 
 func (fl *shardedFreeList) put(slabID int32, a *Slabby) {
+	// Probe for a shard with capacity, matching get()'s random-probe
+	// strategy. Using getImprovedShardIndex alone would cause imbalance
+	// because get() randomly drains across shards.
+	startIdx := a.fastrand() & fl.shardMask
+
+	for attempt := 0; attempt < len(fl.shardArray); attempt++ {
+		shardIdx := (startIdx + uint32(attempt)) & fl.shardMask
+		shard := &fl.shardArray[shardIdx]
+		shard.mu.Lock()
+		if shard.count < len(shard.slabIDs) {
+			shard.slabIDs[shard.count] = slabID
+			shard.count++
+			shard.mu.Unlock()
+			return
+		}
+		shard.mu.Unlock()
+	}
+
+	// All shards at capacity — use home shard and let push handle overflow.
 	shardIdx := getImprovedShardIndex(slabID, len(fl.shardArray))
 	shard := &fl.shardArray[shardIdx]
 	shard.push(slabID)
