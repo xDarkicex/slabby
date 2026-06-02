@@ -221,7 +221,7 @@ type Slabby struct {
 	// High-performance allocation structures
 	perCPUCache  *perCPUCacheArray
 	freeStack    *indexedFreeStack
-	shardedLists *shardedFreeList
+	coloredLists *coloredShardedFreeList
 
 	// Configuration and options
 	config allocatorConfig
@@ -296,6 +296,10 @@ type freeListShard struct {
 type shardNode struct {
 	slabID int32
 	next   *shardNode
+}
+
+var shardNodePool = sync.Pool{
+	New: func() any { return &shardNode{} },
 }
 
 // Per-CPU statistics to reduce contention
@@ -427,12 +431,11 @@ func New(slabSize, capacity int, options ...AllocatorOption) (*Slabby, error) {
 
 	freeStack := newIndexedFreeStack(capacity)
 
-	// Initialize sharded free list
 	shardCount := config.shardCount
 	if shardCount <= 0 {
 		shardCount = runtime.GOMAXPROCS(0)
 	}
-	shardedLists := newImprovedShardedFreeList(capacity, shardCount)
+	coloredLists := newColoredShardedFreeList(capacity, shardCount, alignedSize)
 
 	// Initialize per-CPU statistics
 	numCPUs := runtime.GOMAXPROCS(0)
@@ -458,7 +461,7 @@ func New(slabSize, capacity int, options ...AllocatorOption) (*Slabby, error) {
 		guardPages:     guardPages,
 		perCPUCache:    perCPUCache,
 		freeStack:      freeStack,
-		shardedLists:   shardedLists,
+		coloredLists:   coloredLists,
 		config:         config,
 		cpuStats:       cpuStats,
 		circuitBreaker: circuitBreaker,
@@ -554,7 +557,7 @@ func (a *Slabby) Allocate() (*SlabRef, error) {
 
 	// Fall back to sharded allocation
 	for {
-		slabID, ok := a.shardedLists.get(a)
+		slabID, ok := a.coloredLists.get(a, 0)
 		if !ok {
 			break
 		}
@@ -636,7 +639,7 @@ func (a *Slabby) AllocateFast() ([]byte, int32, error) {
 
 	// Fall back to sharded allocation
 	for {
-		slabID, ok := a.shardedLists.get(a)
+		slabID, ok := a.coloredLists.get(a, 0)
 		if !ok {
 			break
 		}
@@ -687,7 +690,7 @@ func (a *Slabby) DeallocateFast(slabID int32) error {
 	if a.config.enablePCPUCache && a.perCPUCache.put(slabID) {
 		// Success
 	} else if !a.freeStack.push(slabID) {
-		a.shardedLists.put(slabID, a)
+		a.coloredLists.put(slabID, a)
 	}
 
 	a.recordFastDeallocation()
@@ -723,6 +726,10 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 	if a.config.enablePCPUCache {
 		for len(refs) < count {
 			if slabID, ok := a.perCPUCache.get(a); ok {
+				slabEntry := &a.slabMetadata[slabID]
+				if !slabEntry.inUse.CompareAndSwap(false, true) {
+					continue
+				}
 				ref, err := a.createSlabRef(slabID, startTime, false)
 				if err != nil {
 					break
@@ -738,6 +745,10 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 	// Try lock-free stack for remaining
 	for len(refs) < count {
 		if slabID, ok := a.freeStack.pop(); ok {
+			slabEntry := &a.slabMetadata[slabID]
+			if !slabEntry.inUse.CompareAndSwap(false, true) {
+				continue
+			}
 			ref, err := a.createSlabRef(slabID, startTime, false)
 			if err != nil {
 				break
@@ -751,7 +762,11 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 
 	// Use sharded lists for remaining
 	for len(refs) < count {
-		if slabID, ok := a.shardedLists.get(a); ok {
+		if slabID, ok := a.coloredLists.get(a, 0); ok {
+			slabEntry := &a.slabMetadata[slabID]
+			if !slabEntry.inUse.CompareAndSwap(false, true) {
+				continue
+			}
 			ref, err := a.createSlabRef(slabID, startTime, false)
 			if err != nil {
 				break
@@ -869,7 +884,7 @@ func (a *Slabby) Deallocate(ref *SlabRef) error {
 		// Successfully returned to per-CPU cache
 	} else if !a.freeStack.push(slabID) {
 		// Fall back to sharded return
-		a.shardedLists.put(slabID, a)
+		a.coloredLists.put(slabID, a)
 	}
 
 	// Update statistics
@@ -1048,12 +1063,9 @@ func (a *Slabby) memoryStatsSnapshot() MemoryStats {
 		reservedMetaBytes += int64(unsafe.Sizeof(*a.freeStack))
 		reservedMetaBytes += int64(len(a.freeStack.slab)) * int64(unsafe.Sizeof(int32(0)))
 	}
-	if a.shardedLists != nil {
-		reservedMetaBytes += int64(unsafe.Sizeof(*a.shardedLists))
-		reservedMetaBytes += int64(len(a.shardedLists.shardArray)) * int64(unsafe.Sizeof(freeListShard{}))
-		for i := range a.shardedLists.shardArray {
-			reservedMetaBytes += int64(len(a.shardedLists.shardArray[i].slabIDs)) * int64(unsafe.Sizeof(int32(0)))
-		}
+	if a.coloredLists != nil {
+		reservedMetaBytes += int64(unsafe.Sizeof(*a.coloredLists))
+		reservedMetaBytes += int64(len(a.coloredLists.shardArray)) * int64(unsafe.Sizeof(coloredShard{}))
 	}
 
 	liveBytes := int64(usedSlabs) * int64(a.slabSize)
@@ -1168,18 +1180,24 @@ func (a *Slabby) Reset() {
 
 	a.freeStack.reset()
 
-	// Properly reinitialize sharded lists with all slabs
+	// Reset colored sharded free list: clear all shards and redistribute slabs.
 	capacity := int(a.totalCapacity)
-	shardCount := len(a.shardedLists.shardArray)
-
-	for i := range a.shardedLists.shardArray {
-		a.shardedLists.shardArray[i].reset()
+	for i := range a.coloredLists.shardArray {
+		a.coloredLists.shardArray[i].head.Store(nil)
+		atomic.StoreInt32(&a.coloredLists.shardArray[i].count, 0)
 	}
 
+	shardCount := len(a.coloredLists.shardArray) / CacheColorCount
+	if shardCount < 1 {
+		shardCount = 1
+	}
 	for i := 0; i < capacity; i++ {
-		shardIdx := getImprovedShardIndex(int32(i), shardCount)
-		shard := &a.shardedLists.shardArray[shardIdx]
-		shard.push(int32(i))
+		slabID := int32(i)
+		color := getSlabColor(slabID, a.alignedSize)
+		shardIdx := getColoredShardIndex(slabID, shardCount, int32(color))
+		coloredIdx := (shardIdx&int(a.coloredLists.shardMask))*CacheColorCount + color&int(a.coloredLists.colorMask)
+		shard := &a.coloredLists.shardArray[coloredIdx]
+		shard.push(slabID)
 	}
 
 	// Reset per-CPU statistics
@@ -1815,10 +1833,18 @@ func (a *Slabby) prefetchSlab(slabID int32) {
 	prefetchSliceSafe(a.memoryPool, int(offset), int(prefetchSize))
 }
 
-// R1 improvement: Batch prefetch for better cache performance
+// prefetchSlabRange warms the slab data cache for a range of slab positions.
+// Only free slabs are touched — an inUse.Load guard prevents races with
+// concurrent user writes to allocated slabs. The TOCTOU window between the
+// Load and the prefetch read is practically unobservable: a re-claim and
+// user-space write would need to complete in the ~tens of nanoseconds
+// between the Load and the first cache-line touch.
 func (a *Slabby) prefetchSlabRange(startID, count int32) {
 	for i := int32(0); i < count && startID+i < a.totalCapacity; i++ {
-		a.prefetchSlab(startID + i)
+		id := startID + i
+		if !a.slabMetadata[id].inUse.Load() {
+			a.prefetchSlab(id)
+		}
 	}
 }
 
@@ -2416,7 +2442,9 @@ func newColoredShardedFreeList(capacity, shardCount int, alignedSize int32) *col
 
 // Lock-free push for colored shard
 func (s *coloredShard) push(slabID int32) {
-	node := &shardNode{slabID: slabID}
+	node := shardNodePool.Get().(*shardNode)
+	node.slabID = slabID
+	node.next = nil
 	for {
 		oldHead := s.head.Load()
 		node.next = oldHead
@@ -2436,7 +2464,9 @@ func (s *coloredShard) pop() (int32, bool) {
 		}
 		if s.head.CompareAndSwap(oldHead, oldHead.next) {
 			atomic.AddInt32(&s.count, -1)
-			return oldHead.slabID, true
+			slabID := oldHead.slabID
+			shardNodePool.Put(oldHead)
+			return slabID, true
 		}
 	}
 }

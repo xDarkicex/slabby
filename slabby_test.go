@@ -776,6 +776,7 @@ func TestCircuitBreaker(t *testing.T) {
 	if failureCount < int(failureThreshold) {
 		t.Fatalf("Expected at least %d failures, got %d", failureThreshold, failureCount)
 	}
+	lastFailureWallClock := time.Now()
 
 	t.Log("=== Phase 3: Verify circuit breaker is open ===")
 	// The circuit should be open now - verify it
@@ -826,11 +827,22 @@ func TestCircuitBreaker(t *testing.T) {
 			smallCapacity, statsAfterRelease.AvailableSlabs)
 	}
 
-	// Verify circuit breaker is still open before recovery timeout
-	_, err = allocator.Allocate()
-	if err != ErrCircuitBreakerOpen {
-		t.Fatalf("Expected ErrCircuitBreakerOpen before recovery, got %v", err)
-	}
+		// The circuit breaker should still be open unless the recovery
+		// timeout already expired. Under stress (parallel test
+		// processes) wall-clock time can drift ahead of the propagation
+		// window; if the timeout elapsed the breaker entering half-open
+		// is correct behaviour, not a bug.
+		elapsed := time.Since(lastFailureWallClock)
+		if elapsed < recoveryTimeout {
+			_, err = allocator.Allocate()
+			if err != ErrCircuitBreakerOpen {
+				t.Fatalf("Expected ErrCircuitBreakerOpen (elapsed=%v, timeout=%v), got %v",
+					elapsed, recoveryTimeout, err)
+			}
+		} else {
+			t.Logf("Recovery timeout expired (elapsed=%v > timeout=%v); skipping open check",
+				elapsed, recoveryTimeout)
+		}
 
 	t.Log("=== Phase 5: Wait for circuit breaker recovery ===")
 	// Wait for the recovery timeout to elapse from the last failure

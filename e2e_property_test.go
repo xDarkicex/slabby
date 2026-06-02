@@ -302,16 +302,22 @@ func TestE2E_PerformanceUnderLoad(t *testing.T) {
 	require.NoError(t, err)
 	defer allocator.Close()
 
-	start := time.Now()
 	var wg sync.WaitGroup
 	var allocCount, freeCount int32
 	numGoroutines := 20
 	opsPerGoroutine := 200
 
+	// Barrier: start the timer only after all goroutines are spawned so
+	// process-creation jitter (especially under parallel stress) does not
+	// count against the throughput measurement.
+	ready := make(chan struct{})
+	start := make(chan struct{})
 	for g := 0; g < numGoroutines; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			ready <- struct{}{}
+			<-start
 			for i := 0; i < opsPerGoroutine; i++ {
 				ref, err := allocator.Allocate()
 				if err == nil {
@@ -326,9 +332,13 @@ func TestE2E_PerformanceUnderLoad(t *testing.T) {
 			}
 		}()
 	}
-
+	for g := 0; g < numGoroutines; g++ {
+		<-ready
+	}
+	t0 := time.Now()
+	close(start)
 	wg.Wait()
-	elapsed := time.Since(start)
+	elapsed := time.Since(t0)
 
 	opsPerSec := float64(allocCount) / elapsed.Seconds()
 	t.Logf("Performance: %d ops in %v (%.0f ops/sec)",
@@ -338,9 +348,13 @@ func TestE2E_PerformanceUnderLoad(t *testing.T) {
 	stats := allocator.Stats()
 	assert.Equal(t, allocCount-freeCount, int32(stats.CurrentAllocations))
 
-	// Performance assertion - should handle at least 50K ops/sec
-	assert.Greater(t, opsPerSec, 50000.0,
-		"Should handle at least 50K operations per second")
+	// Performance assertion — skipped under the race detector because
+	// instrumentation slows execution by a variable 5-20×, making any
+	// fixed throughput threshold hardware-dependent and meaningless.
+	if !raceEnabled {
+		assert.Greater(t, opsPerSec, 50000.0,
+			"Should handle at least 50K operations per second")
+	}
 }
 
 // TestE2E_HealthMonitoringIntegration tests health monitoring integration
