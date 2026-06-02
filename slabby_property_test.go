@@ -423,16 +423,20 @@ func (pt *PropertyTester) RunConcurrentTest(t *testing.T, allocator *Slabby) {
 		go func(goroutineID int) {
 			defer wg.Done()
 			localState := &goroutineStates[goroutineID]
+			// math/rand.Rand is not safe for concurrent use; give each
+			// goroutine its own RNG seeded deterministically from the
+			// test seed plus the goroutine ID.
+			localRand := rand.New(rand.NewSource(pt.config.Seed + int64(goroutineID)))
 
 			for i := 0; i < pt.config.MaxOperations/pt.config.NumGoroutines; i++ {
 				// Generate operation based on local state
 				var op TestOperation
 				allocatedCount := len(localState.allocatedRefs) + len(localState.fastAllocatedIDs)
-				
+
 				// Bias towards allocation when we have few, deallocation when we have many
-				if allocatedCount == 0 || (allocatedCount < 10 && pt.rand.Float32() < 0.7) {
+				if allocatedCount == 0 || (allocatedCount < 10 && localRand.Float32() < 0.7) {
 					// Allocate
-					if pt.config.EnableFastPath && pt.rand.Float32() < 0.2 {
+					if pt.config.EnableFastPath && localRand.Float32() < 0.2 {
 						op = &FastAllocationOp{}
 					} else {
 						op = &AllocationOp{}
@@ -440,12 +444,12 @@ func (pt *PropertyTester) RunConcurrentTest(t *testing.T, allocator *Slabby) {
 				} else {
 					// Deallocate
 					if len(localState.allocatedRefs) > 0 {
-						idx := pt.rand.Intn(len(localState.allocatedRefs))
+						idx := localRand.Intn(len(localState.allocatedRefs))
 						ref := localState.allocatedRefs[idx]
 						localState.allocatedRefs = append(localState.allocatedRefs[:idx], localState.allocatedRefs[idx+1:]...)
 						op = &DeallocationOp{ref: ref}
 					} else if len(localState.fastAllocatedIDs) > 0 {
-						idx := pt.rand.Intn(len(localState.fastAllocatedIDs))
+						idx := localRand.Intn(len(localState.fastAllocatedIDs))
 						id := localState.fastAllocatedIDs[idx]
 						localState.fastAllocatedIDs = append(localState.fastAllocatedIDs[:idx], localState.fastAllocatedIDs[idx+1:]...)
 						op = &FastDeallocationOp{id: id}
