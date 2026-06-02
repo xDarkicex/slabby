@@ -270,15 +270,6 @@ func (a *MmapAllocator) checkReturnToOS() {
 	}
 }
 
-// getMmapOS returns platform-specific mmap functions
-func getMmapOS() mmapOS {
-	return mmapOS{
-		mmap:    unixMmap,
-		munmap:  unixMunmap,
-		madvise: unixMadvise,
-	}
-}
-
 // Close shuts down the mmap allocator
 func (a *MmapAllocator) Close() error {
 	return nil

@@ -10,6 +10,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// getMmapOS returns platform-specific mmap functions
+func getMmapOS() mmapOS {
+	return mmapOS{
+		mmap:    unixMmap,
+		munmap:  unixMunmap,
+		madvise: unixMadvise,
+	}
+}
+
 // unixMmap allocates memory using mmap on Unix systems
 // This is the real mmap implementation using golang.org/x/sys/unix
 func unixMmap(length int) (unsafe.Pointer, error) {

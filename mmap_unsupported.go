@@ -1,4 +1,4 @@
-//go:build !linux && !darwin && !freebsd && !netbsd && !openbsd
+//go:build !linux && !darwin && !freebsd && !netbsd && !openbsd && !windows
 
 package slabby
 
@@ -8,19 +8,28 @@ import (
 )
 
 // ErrPlatformUnsupported is returned when mmap is not supported on the platform
-var ErrPlatformUnsupported = errors.New("slabby: mmap is not supported on this platform (Linux, macOS, and BSD only)")
+var ErrPlatformUnsupported = errors.New("slabby: mmap is not supported on this platform (Linux, macOS, BSD, and Windows only)")
 
-// unixMmap returns an error on unsupported platforms
-func unixMmap(length int) (unsafe.Pointer, error) {
+// unsupportedMmap returns an error on platforms without a real mapping primitive
+func unsupportedMmap(length int) (unsafe.Pointer, error) {
 	return nil, ErrPlatformUnsupported
 }
 
-// unixMunmap returns an error on unsupported platforms
-func unixMunmap(addr unsafe.Pointer, length int) error {
+// unsupportedMunmap returns an error on unsupported platforms
+func unsupportedMunmap(addr unsafe.Pointer, length int) error {
 	return ErrPlatformUnsupported
 }
 
-// unixMadvise returns an error on unsupported platforms
-func unixMadvise(addr unsafe.Pointer, length int, advice int) error {
+// unsupportedMadvise returns an error on unsupported platforms
+func unsupportedMadvise(addr unsafe.Pointer, length int, advice int) error {
 	return ErrPlatformUnsupported
+}
+
+// getMmapOS returns platform-specific mmap functions
+func getMmapOS() mmapOS {
+	return mmapOS{
+		mmap:    unsupportedMmap,
+		munmap:  unsupportedMunmap,
+		madvise: unsupportedMadvise,
+	}
 }
