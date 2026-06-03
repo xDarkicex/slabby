@@ -1,13 +1,11 @@
 # Slabby - Zero-Allocation Slab Allocator for Go
 
-<div align="center">
-
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go)](https://golang.org/doc/devel/release.html)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
-[![GoDoc](https://img.shields.io/badge/pkg.go.dev-doc-blue?style=for-the-badge&logo=go)](https://pkg.go.dev/github.com/xDarkicex/slabby)
-[![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/slabby?style=for-the-badge)](https://goreportcard.com/report/github.com/xDarkicex/slabby)
-
-</div>
+[![Go Reference](https://pkg.go.dev/badge/github.com/xDarkicex/slabby.svg)](https://pkg.go.dev/github.com/xDarkicex/slabby)
+[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8.svg?style=flat-square)](https://go.dev/)
+[![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/slabby)](https://goreportcard.com/report/github.com/xDarkicex/slabby)
+[![Test](https://img.shields.io/github/actions/workflow/status/xDarkicex/slabby/test.yml?branch=main&style=flat-square)](https://github.com/xDarkicex/slabby/actions/workflows/test.yml)
+[![Coverage](https://img.shields.io/endpoint?style=flat-square&url=https://raw.githubusercontent.com/xDarkicex/slabby/coverage/coverage.json)](https://github.com/xDarkicex/slabby/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 
 **Slabby** is a zero-allocation slab allocator for Go with enterprise-grade features, designed for high-performance applications requiring predictable memory allocation patterns.
 
