@@ -28,6 +28,7 @@ type LeakDetector struct {
 
 	// Tracking - tracks net allocations per stack
 	allocations   sync.Map // stackHash -> *stackSet
+	allocMu       sync.RWMutex // serializes Clear with Report
 	uniqueStacks  int32    // Accessed atomically
 	totalAllocs   int64    // Total allocations sampled
 	totalDeallocs int64    // Total deallocations sampled
@@ -328,6 +329,7 @@ func (ld *LeakDetector) Report() LeakReport {
 	nowStr := now.Format(time.RFC3339)
 
 	// Scan all tracked stacks
+	ld.allocMu.RLock()
 	ld.allocations.Range(func(key, value any) bool {
 		set := value.(*stackSet)
 		set.mu.Lock()
@@ -337,7 +339,7 @@ func (ld *LeakDetector) Report() LeakReport {
 			age := now.Sub(set.firstSeen)
 
 			// Check age threshold
-			if age > ld.ageThreshold {
+			if age >= ld.ageThreshold {
 				// Generate suggested fix
 				suggestion := ld.suggestFix(set)
 
@@ -357,6 +359,7 @@ func (ld *LeakDetector) Report() LeakReport {
 		set.mu.Unlock()
 		return true
 	})
+	ld.allocMu.RUnlock()
 
 	// Sort leaks by net count (most active allocations first)
 	sort.Slice(leaks, func(i, j int) bool {
@@ -445,7 +448,9 @@ func (ld *LeakDetector) String() string {
 
 // Clear removes all tracked allocations
 func (ld *LeakDetector) Clear() {
+	ld.allocMu.Lock()
 	ld.allocations = sync.Map{}
+	ld.allocMu.Unlock()
 	atomic.StoreInt64(&ld.totalAllocs, 0)
 	atomic.StoreInt64(&ld.totalDeallocs, 0)
 	atomic.StoreInt64(&ld.totalLeaks, 0)

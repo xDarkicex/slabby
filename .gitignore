@@ -24,3 +24,6 @@ go.sum
 .vscode/
 .env
 .env.*
+
+# Testing task tracker (local only, not committed)
+testing_tasks.md

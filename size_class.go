@@ -333,6 +333,9 @@ func (a *SizeClassAllocator) allocateLarge(size int) (*MultiSizeRef, error) {
 }
 
 func (a *SizeClassAllocator) AllocateFast(size int) ([]byte, int, error) {
+	if size <= 0 {
+		return nil, -1, fmt.Errorf("slabby: invalid allocation size %d", size)
+	}
 	classIdx := a.SizeToClass(size)
 	if classIdx < 0 {
 		ptr, err := a.largeAllocator.Allocate(size)
@@ -521,6 +524,9 @@ func (a *SizeClassAllocator) Close() error {
 
 // Allocate allocates memory using mmap
 func (l *LargeAllocator) Allocate(size int) (unsafe.Pointer, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("slabby: invalid large allocation size %d", size)
+	}
 	// TODO: Implement mmap-based allocation
 	// For now, fallback to make slice
 	atomic.AddUint64(&l.allocations, 1)

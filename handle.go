@@ -109,7 +109,7 @@ func (a *HandleAllocator) FreeHandle(h Handle) error {
 	}
 
 	// Check generation mismatch
-	currentGen := a.generations[slabID]
+	currentGen := atomic.LoadUint32(&a.generations[slabID])
 	if gen != currentGen {
 		atomic.AddUint64(&a.stats.genMismatches, 1)
 		return ErrStaleHandle
@@ -141,7 +141,7 @@ func (a *HandleAllocator) GetBytes(h Handle) ([]byte, error) {
 	}
 
 	// Check generation mismatch
-	currentGen := a.generations[slabID]
+	currentGen := atomic.LoadUint32(&a.generations[slabID])
 	if gen != currentGen {
 		atomic.AddUint64(&a.stats.staleAccesses, 1)
 		return nil, ErrStaleHandle
