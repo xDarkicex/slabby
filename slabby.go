@@ -281,18 +281,7 @@ type pcpuCacheEntry struct {
 	hits  uint64                 // Cache hit counter (atomic)
 }
 
-// Sharded free list with improved distribution.
-type shardedFreeList struct {
-	shardArray []freeListShard
-	shardMask  uint32
-}
-
-type freeListShard struct {
-	mu      sync.Mutex
-	slabIDs []int32
-	count   int
-}
-
+// Lock-free shard node for colored free list.
 type shardNode struct {
 	slabID atomic.Int32
 	next   atomic.Pointer[shardNode]
@@ -1456,122 +1445,6 @@ func (c *perCPUCacheArray) put(slabID int32) bool {
 	cpuID := getFastCPUID()
 	cache := &c.caches[cpuID&c.mask]
 	return c.putInternal(cache, slabID)
-}
-
-func (s *freeListShard) push(slabID int32) {
-	s.mu.Lock()
-	if s.count >= len(s.slabIDs) {
-		// Rebalance overflow: get() uses random probing which can drain
-		// a different shard than put() routes to via getImprovedShardIndex.
-		// Grow the array so the shard can absorb redistribution.
-		newCap := len(s.slabIDs) * 2
-		if newCap < 16 {
-			newCap = 16
-		}
-		newSlabIDs := make([]int32, newCap)
-		copy(newSlabIDs, s.slabIDs)
-		s.slabIDs = newSlabIDs
-	}
-	s.slabIDs[s.count] = slabID
-	s.count++
-	s.mu.Unlock()
-}
-
-func (s *freeListShard) pop() (int32, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.count == 0 {
-		return -1, false
-	}
-	s.count--
-	return s.slabIDs[s.count], true
-}
-
-func (s *freeListShard) tryPop() (int32, bool) {
-	return s.pop()
-}
-
-func (s *freeListShard) reset() {
-	s.mu.Lock()
-	s.count = 0
-	s.mu.Unlock()
-}
-
-func newImprovedShardedFreeList(capacity, shardCount int) *shardedFreeList {
-	actualShardCount := nextPowerOfTwo(uint32(shardCount))
-	mask := actualShardCount - 1
-
-	fl := &shardedFreeList{
-		shardArray: make([]freeListShard, actualShardCount),
-		shardMask:  mask,
-	}
-
-	for i := 0; i < capacity; i++ {
-		shardIdx := getImprovedShardIndex(int32(i), int(actualShardCount))
-		fl.shardArray[shardIdx].count++
-	}
-
-	for i := range fl.shardArray {
-		shard := &fl.shardArray[i]
-		if shard.count == 0 {
-			continue
-		}
-		shard.slabIDs = make([]int32, shard.count)
-		shard.count = 0
-	}
-
-	for i := 0; i < capacity; i++ {
-		shardIdx := getImprovedShardIndex(int32(i), int(actualShardCount))
-		shard := &fl.shardArray[shardIdx]
-		shard.push(int32(i))
-	}
-
-	return fl
-}
-
-func (fl *shardedFreeList) get(a *Slabby) (int32, bool) {
-	startIdx := a.fastrand() & fl.shardMask
-
-	for attempt := 0; attempt < len(fl.shardArray); attempt++ {
-		shardIdx := (startIdx + uint32(attempt)) & fl.shardMask
-		shard := &fl.shardArray[shardIdx]
-
-		if slabID, ok := shard.tryPop(); ok {
-			return slabID, true
-		}
-
-		// Brief backoff on contention
-		if attempt > 0 {
-			runtime.Gosched()
-		}
-	}
-	return -1, false
-}
-
-func (fl *shardedFreeList) put(slabID int32, a *Slabby) {
-	// Probe for a shard with capacity, matching get()'s random-probe
-	// strategy. Using getImprovedShardIndex alone would cause imbalance
-	// because get() randomly drains across shards.
-	startIdx := a.fastrand() & fl.shardMask
-
-	for attempt := 0; attempt < len(fl.shardArray); attempt++ {
-		shardIdx := (startIdx + uint32(attempt)) & fl.shardMask
-		shard := &fl.shardArray[shardIdx]
-		shard.mu.Lock()
-		if shard.count < len(shard.slabIDs) {
-			shard.slabIDs[shard.count] = slabID
-			shard.count++
-			shard.mu.Unlock()
-			return
-		}
-		shard.mu.Unlock()
-	}
-
-	// All shards at capacity — use home shard and let push handle overflow.
-	shardIdx := getImprovedShardIndex(slabID, len(fl.shardArray))
-	shard := &fl.shardArray[shardIdx]
-	shard.push(slabID)
 }
 
 // createSlabRef creates a SlabRef for an already-claimed slab
