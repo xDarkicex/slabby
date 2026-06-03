@@ -14,7 +14,6 @@ fuzz-target/
 
 # Go module cache and dependencies
 /vendor/
-go.sum
 
 # macOS-specific files
 .DS_Store
