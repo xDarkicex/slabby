@@ -308,6 +308,7 @@ type cpuStatEntry struct {
 	samplingCounter    uint32
 	loadCounter        uint64 // Track allocation load for adaptive sampling
 	refPoolHits        uint64 // New metric
+	lockFreeHits       uint64 // Lock-free stack hits
 	generation         uint64 // For atomic snapshot verification
 	// Ring buffer for latency percentiles (smaller per-CPU)
 	latencyBuffer    [64]int64
@@ -520,8 +521,7 @@ func (a *Slabby) Allocate() (*SlabRef, error) {
 			// CRITICAL: inUse is the single source of truth
 			slabEntry := &a.slabMetadata[slabID]
 			if slabEntry.inUse.CompareAndSwap(false, true) {
-				a.recordPCPUCacheHit()
-				return a.createSlabRef(slabID, startTime, false)
+return a.createSlabRef(slabID, startTime, false)
 			}
 			// CAS failed - slab already claimed, try another
 		}
@@ -598,8 +598,7 @@ func (a *Slabby) AllocateFast() ([]byte, int32, error) {
 			if slabEntry.inUse.CompareAndSwap(false, true) {
 				data := a.getSlabBytes(slabID)
 				a.recordFastAllocation()
-				a.recordPCPUCacheHit()
-				a.trackAllocationLatency(startTime)
+a.trackAllocationLatency(startTime)
 				a.recordCircuitBreakerSuccess()
 				return data, slabID, nil
 			}
@@ -724,7 +723,6 @@ func (a *Slabby) BatchAllocate(count int) ([]*SlabRef, error) {
 					break
 				}
 				refs = append(refs, ref)
-				a.recordPCPUCacheHit()
 			} else {
 				break
 			}
@@ -931,6 +929,7 @@ func (a *Slabby) Stats() *AllocatorStats {
 	var maxAllocTime int64
 	var totalErrors, totalHeapFallbacks, totalGuardViolations uint64
 	var totalRefPoolHits uint64
+	var totalLockFreeHits uint64
 
 	for i := range a.cpuStats {
 		cpu := &a.cpuStats[i]
@@ -945,8 +944,9 @@ func (a *Slabby) Stats() *AllocatorStats {
 		totalHeapFallbacks += atomic.LoadUint64(&cpu.heapFallbacks)
 		totalGuardViolations += atomic.LoadUint64(&cpu.guardViolations)
 		totalRefPoolHits += atomic.LoadUint64(&cpu.refPoolHits)
+			totalLockFreeHits += atomic.LoadUint64(&cpu.lockFreeHits)
 
-		cpuMax := atomic.LoadInt64(&cpu.maxAllocTime)
+			cpuMax := atomic.LoadInt64(&cpu.maxAllocTime)
 		if cpuMax > maxAllocTime {
 			maxAllocTime = cpuMax
 		}
@@ -980,7 +980,7 @@ func (a *Slabby) Stats() *AllocatorStats {
 	}
 
 	// Get cache hit statistics
-	var pcpuCacheHits, lockFreeHits uint64
+	var pcpuCacheHits uint64
 	if a.config.enablePCPUCache {
 		for i := range a.perCPUCache.caches {
 			pcpuCacheHits += atomic.LoadUint64(&a.perCPUCache.caches[i].hits)
@@ -1017,7 +1017,7 @@ func (a *Slabby) Stats() *AllocatorStats {
 		DeallocationErrors:  totalErrors, // Combined for simplicity
 		HeapFallbacks:       totalHeapFallbacks,
 		PCCPUCacheHits:      pcpuCacheHits,
-		LockFreeHits:        lockFreeHits,
+		LockFreeHits:        totalLockFreeHits,
 		GuardPageViolations: totalGuardViolations,
 		RefPoolHits:         totalRefPoolHits,
 	}
@@ -1206,7 +1206,8 @@ func (a *Slabby) Reset() {
 		cpu.samplingCounter = 0
 		atomic.StoreUint64(&cpu.loadCounter, 0)
 		atomic.StoreUint64(&cpu.refPoolHits, 0)
-		cpu.latencyBufferIdx = 0
+			atomic.StoreUint64(&cpu.lockFreeHits, 0)
+			cpu.latencyBufferIdx = 0
 		for j := range cpu.latencyBuffer {
 			cpu.latencyBuffer[j] = 0
 		}
@@ -1409,6 +1410,8 @@ func (c *perCPUCacheArray) get(a *Slabby) (int32, bool) {
 		return -1, false
 	}
 
+	a.recordLockFreeHit()
+
 	// Use the put protocol to add to cache
 	if c.putInternal(cache, slabID) {
 		return slabID, true
@@ -1564,12 +1567,10 @@ func (a *Slabby) recordGuardViolation() {
 	atomic.AddUint64(&cpu.guardViolations, 1)
 }
 
-func (a *Slabby) recordPCPUCacheHit() {
-	// Already recorded in perCPUCache.get()
-}
-
 func (a *Slabby) recordLockFreeHit() {
-	// Could add lock-free hit counter if needed
+	cpuID := getFastCPUID()
+	cpu := &a.cpuStats[cpuID&uint64(len(a.cpuStats)-1)]
+	atomic.AddUint64(&cpu.lockFreeHits, 1)
 }
 
 func (a *Slabby) recordRefPoolHit() {

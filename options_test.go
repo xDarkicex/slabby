@@ -507,3 +507,27 @@ func TestWithHealthInterval(t *testing.T) {
 		t.Errorf("health score out of range: %f", health.HealthScore)
 	}
 }
+
+// TestLockFreeHitTracking verifies LockFreeHits are counted when PCPUCache
+// is disabled, forcing deallocations through the free stack.
+func TestLockFreeHitTracking(t *testing.T) {
+	a, err := New(256, 500, WithPCPUCache(false))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer a.Close()
+
+	for i := 0; i < 200; i++ {
+		ref, err := a.Allocate()
+		if err != nil {
+			t.Fatalf("Allocate %d failed: %v", i, err)
+		}
+		ref.Release()
+	}
+
+	stats := a.Stats()
+	t.Logf("LockFreeHits=%d PCCPUCacheHits=%d", stats.LockFreeHits, stats.PCCPUCacheHits)
+	if stats.LockFreeHits == 0 {
+		t.Error("LockFreeHits should be > 0 with PCPUCache disabled")
+	}
+}

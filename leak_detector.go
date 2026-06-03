@@ -44,6 +44,19 @@ type LeakDetector struct {
 
 	// Sampling
 	sampleCounter uint32 // Accessed atomically
+
+	// Health context — correlates leak patterns with allocator health
+	stateTransitions [8]leakStateTransition
+	stateTransIdx    uint32
+	lastSnapshot     atomic.Pointer[HealthSnapshot]
+}
+
+// leakStateTransition records a health state change for leak correlation.
+// Fixed-size struct, zero heap allocations.
+type leakStateTransition struct {
+	prev uint32 // HealthState
+	curr uint32 // HealthState
+	at   uint64 // unix nano
 }
 
 // stackSet tracks allocations for a specific stack trace
@@ -71,14 +84,23 @@ type LeakInfo struct {
 	SuggestedFix string        `json:"suggested_fix"`
 }
 
-// LeakReport is a snapshot of leak detection state
+// LeakReport is a snapshot of leak detection state with health context.
 type LeakReport struct {
-	Timestamp      time.Time  `json:"timestamp"`
-	TotalAllocs    int64      `json:"total_allocations"`
-	TotalDeallocs  int64      `json:"total_deallocations"`
-	TotalLeaks     int64      `json:"net_leaked"`
-	UniqueStacks   int        `json:"unique_stack_traces"`
-	PotentialLeaks []LeakInfo `json:"potential_leaks"`
+	Timestamp        time.Time         `json:"timestamp"`
+	TotalAllocs      int64             `json:"total_allocations"`
+	TotalDeallocs    int64             `json:"total_deallocations"`
+	TotalLeaks       int64             `json:"net_leaked"`
+	UniqueStacks     int               `json:"unique_stack_traces"`
+	PotentialLeaks   []LeakInfo        `json:"potential_leaks"`
+	StateTransitions []StateTransition `json:"state_transitions,omitempty"`
+	HealthSnapshot   *HealthSnapshot   `json:"health_snapshot,omitempty"`
+}
+
+// StateTransition records a health state change for leak correlation.
+type StateTransition struct {
+	Prev uint32 `json:"prev"` // HealthState
+	Curr uint32 `json:"curr"` // HealthState
+	At   uint64 `json:"at"`   // unix nano
 }
 
 // LeakDetectorConfig holds configuration for leak detection
@@ -213,14 +235,21 @@ func (ld *LeakDetector) OnDeallocate(state HealthState, success bool) {
 	atomic.AddInt64(&ld.totalLeaks, -1)
 }
 
-// OnStateChange is called when health state changes
+// OnStateChange records state transitions in a lock-free ring buffer.
+// O(1), zero allocations — fixed-size array on the struct.
 func (ld *LeakDetector) OnStateChange(prev, curr HealthState, reason string) {
-	// Not used
+	idx := atomic.AddUint32(&ld.stateTransIdx, 1) % uint32(len(ld.stateTransitions))
+	ld.stateTransitions[idx] = leakStateTransition{
+		prev: uint32(prev),
+		curr: uint32(curr),
+		at:   uint64(time.Now().UnixNano()),
+	}
 }
 
-// OnMetricsSnapshot is called periodically
+// OnMetricsSnapshot stores the latest health snapshot for correlation in reports.
+// O(1), one allocation per snapshot interval (not on the hot path).
 func (ld *LeakDetector) OnMetricsSnapshot(snapshot HealthSnapshot) {
-	// Not used - leak detection has its own reporting
+	ld.lastSnapshot.Store(&snapshot)
 }
 
 // captureStack captures the current goroutine's stack trace with proper filtering
@@ -359,6 +388,25 @@ func (ld *LeakDetector) Report() LeakReport {
 		set.mu.Unlock()
 		return true
 	})
+	// Collect state transitions from the ring buffer under the read lock.
+	stateIdx := atomic.LoadUint32(&ld.stateTransIdx)
+	transitions := make([]StateTransition, 0, len(ld.stateTransitions))
+	for i := uint32(0); i < uint32(len(ld.stateTransitions)); i++ {
+		idx := (stateIdx - i) % uint32(len(ld.stateTransitions))
+		t := ld.stateTransitions[idx]
+		if t.at == 0 {
+			continue // Empty slot.
+		}
+		transitions = append(transitions, StateTransition{
+			Prev: t.prev,
+			Curr: t.curr,
+			At:   t.at,
+		})
+	}
+
+	// Load latest health snapshot.
+	snapshot := ld.lastSnapshot.Load()
+
 	ld.allocMu.RUnlock()
 
 	// Sort leaks by net count (most active allocations first)
@@ -374,12 +422,14 @@ func (ld *LeakDetector) Report() LeakReport {
 	_ = nowStr // For future timestamp field
 
 	return LeakReport{
-		Timestamp:      now,
-		TotalAllocs:    atomic.LoadInt64(&ld.totalAllocs),
-		TotalDeallocs:  atomic.LoadInt64(&ld.totalDeallocs),
-		TotalLeaks:     atomic.LoadInt64(&ld.totalLeaks),
-		UniqueStacks:   int(atomic.LoadInt32(&ld.uniqueStacks)),
-		PotentialLeaks: leaks,
+		Timestamp:        now,
+		TotalAllocs:      atomic.LoadInt64(&ld.totalAllocs),
+		TotalDeallocs:    atomic.LoadInt64(&ld.totalDeallocs),
+		TotalLeaks:       atomic.LoadInt64(&ld.totalLeaks),
+		UniqueStacks:     int(atomic.LoadInt32(&ld.uniqueStacks)),
+		PotentialLeaks:   leaks,
+		StateTransitions: transitions,
+		HealthSnapshot:   snapshot,
 	}
 }
 
@@ -450,6 +500,11 @@ func (ld *LeakDetector) String() string {
 func (ld *LeakDetector) Clear() {
 	ld.allocMu.Lock()
 	ld.allocations = sync.Map{}
+	for i := range ld.stateTransitions {
+		ld.stateTransitions[i] = leakStateTransition{}
+	}
+	atomic.StoreUint32(&ld.stateTransIdx, 0)
+	ld.lastSnapshot.Store(nil)
 	ld.allocMu.Unlock()
 	atomic.StoreInt64(&ld.totalAllocs, 0)
 	atomic.StoreInt64(&ld.totalDeallocs, 0)
