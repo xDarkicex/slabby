@@ -294,8 +294,8 @@ type freeListShard struct {
 }
 
 type shardNode struct {
-	slabID int32
-	next   *shardNode
+	slabID atomic.Int32
+	next   atomic.Pointer[shardNode]
 }
 
 var shardNodePool = sync.Pool{
@@ -2443,11 +2443,11 @@ func newColoredShardedFreeList(capacity, shardCount int, alignedSize int32) *col
 // Lock-free push for colored shard
 func (s *coloredShard) push(slabID int32) {
 	node := shardNodePool.Get().(*shardNode)
-	node.slabID = slabID
-	node.next = nil
+	node.slabID.Store(slabID)
+	node.next.Store(nil)
 	for {
 		oldHead := s.head.Load()
-		node.next = oldHead
+		node.next.Store(oldHead)
 		if s.head.CompareAndSwap(oldHead, node) {
 			atomic.AddInt32(&s.count, 1)
 			return
@@ -2462,9 +2462,10 @@ func (s *coloredShard) pop() (int32, bool) {
 		if oldHead == nil {
 			return -1, false
 		}
-		if s.head.CompareAndSwap(oldHead, oldHead.next) {
+		next := oldHead.next.Load()
+		if s.head.CompareAndSwap(oldHead, next) {
 			atomic.AddInt32(&s.count, -1)
-			slabID := oldHead.slabID
+			slabID := oldHead.slabID.Load()
 			shardNodePool.Put(oldHead)
 			return slabID, true
 		}
