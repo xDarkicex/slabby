@@ -139,7 +139,28 @@ type HealthAware struct {
 func NewHealthAware(slab *Slabby, config ...HealthConfig) *HealthAware {
 	cfg := DefaultHealthConfig()
 	if len(config) > 0 {
-		cfg = config[0]
+		user := config[0]
+		if user.CheckInterval > 0 {
+			cfg.CheckInterval = user.CheckInterval
+		}
+		if user.PressureThreshold > 0 {
+			cfg.PressureThreshold = user.PressureThreshold
+		}
+		if user.CriticalThreshold > 0 {
+			cfg.CriticalThreshold = user.CriticalThreshold
+		}
+		if user.FallbackThreshold > 0 {
+			cfg.FallbackThreshold = user.FallbackThreshold
+		}
+		if user.RecoveryThreshold > 0 {
+			cfg.RecoveryThreshold = user.RecoveryThreshold
+		}
+		if user.PressureWindow > 0 {
+			cfg.PressureWindow = user.PressureWindow
+		}
+		cfg.UseGoFallback = user.UseGoFallback
+		cfg.AllocSampleRate = user.AllocSampleRate
+		cfg.DeallocSampleRate = user.DeallocSampleRate
 	}
 
 	ha := &HealthAware{
